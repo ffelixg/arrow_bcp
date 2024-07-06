@@ -261,10 +261,22 @@ fn _write_arrow(args: ?*PyObject) !?*PyObject {
         return Err.PyError;
     };
     defer file.close();
-    for (columns_slice, 0..) |col, i_col| {
-        print("i_col({}) {s} {}\n", .{ i_col, col.schema.format, col.current_array.length });
-        // col.bcp_info.writer(@constCast(&col), &file);
-        col.bcp_info.writer(@constCast(&col), &file) catch unreachable;
+    main_loop: while (true) {
+        for (columns_slice, 0..) |*col, i_col| {
+            print("i_col({}) {s} {}\n", .{ i_col, col.schema.format, col.current_array.length });
+            if (col.next_index >= col.current_array.length) {
+                if (!try col.get_next_array()) {
+                    if (i_col != 0) {
+                        py.PyErr_SetString(py.PyExc_Exception, "Arrays don't have equal length");
+                        return Err.PyError;
+                    } else {
+                        break :main_loop;
+                    }
+                }
+            }
+            col.bcp_info.writer(col, &file) catch unreachable;
+            col.next_index += 1;
+        }
     }
     // _ = file.write("hello");
 
