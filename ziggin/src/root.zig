@@ -58,16 +58,13 @@ var gpa = std.heap.GeneralPurposeAllocator(.{
 const allocator = gpa.allocator();
 
 const BcpInfo = struct {
-    writer: *fn (self: *Column, file: *std.fs.File) void,
-    // writer: @TypeOf(write_l),
+    writer: @TypeOf(&write_l),
     bytes_prefix: u16,
     bytes_data: u16,
     dtype_name: [*:0]u8,
 
     fn init(
-        // self: *BcpInfo,
-        writer: fn (self: *Column, file: *std.fs.File) void,
-        // writer: @TypeOf(write_l),
+        writer: @TypeOf(write_l),
         bytes_prefix: anytype,
         bytes_data: u16,
         comptime dtype_name: []const u8,
@@ -119,7 +116,6 @@ const Column = struct {
 
     fn get_next_array(self: *Column) !bool {
         // return false if no more data
-        // py.Py_XDECREF(self._current_array_capsule)
         if (self._current_array_capsule) |capsule| {
             defer py.Py_DECREF(capsule);
             self._current_array_capsule = null;
@@ -133,20 +129,36 @@ const Column = struct {
         defer py.Py_DECREF(array_capsule);
         const array_ptr = py.PyCapsule_GetPointer(array_capsule, "arrow_array") orelse return Err.PyError;
         const current_array_ptr: *ArrowArray = @alignCast(@ptrCast(array_ptr));
+        if (current_array_ptr.offset != 0) {
+            py.PyErr_SetString(py.PyExc_Exception, "Offset field is not supported");
+            return Err.PyError;
+        }
         self.next_index = 0;
         self.current_array = current_array_ptr.*;
         self._current_array_capsule = py.Py_NewRef(array_capsule);
         return true;
     }
 
-    fn nullable(self: *Column) bool {
-        return self.current_array.buffers[0] != null;
+    inline fn nullable(self: *Column) bool {
+        // no null buffer or null_count = 0 is likely not enough
+        // would need to be the same for every ArrowArray chunk
+        _ = self;
+        return true;
+        // return self.current_array.buffers[0] != null;
+    }
+
+    inline fn valid_buffer(self: *Column) ?[*]bool {
+        return @ptrCast(self.current_array.buffers[0]);
+    }
+
+    inline fn main_buffer(self: *Column) *anyopaque {
+        return @ptrCast(self.current_array.buffers[1] orelse unreachable);
     }
 };
 
 const formats = enum { l, d };
 
-inline fn write(self: *Column, file: *std.fs.File, format: formats) void {
+inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) !void {
     if (format == .d) {
         print("case1\n", .{});
     } else {
@@ -157,23 +169,33 @@ inline fn write(self: *Column, file: *std.fs.File, format: formats) void {
         else => comptime unreachable,
     };
     const type_data = types[0];
-    const val: type_data = 5;
-    const asbytes: [*]u8 = @constCast(@ptrCast(&val));
-    _ = file.write(asbytes[0..@sizeOf(type_data)]) catch unreachable;
-
+    var is_null: bool = false;
     if (self.nullable()) {
+        // const is_null = self.null_buffer()[self.next_index];
+        // is_null = if (self.null_buffer()) |nul_buf| nul_buf[self.next_index] else false;
+        if (self.valid_buffer()) |valid_buffer| {
+            is_null = !valid_buffer[self.next_index];
+        }
         const type_prefix = types[1];
-        const val2: type_prefix = -1;
+        const val2: type_prefix = if (is_null) -1 else @sizeOf(type_data);
         const asbytes2: [*]u8 = @constCast(@ptrCast(&val2));
-        _ = file.write(asbytes2[0..@sizeOf(type_prefix)]) catch unreachable;
+        _ = try file.write(asbytes2[0..@sizeOf(type_prefix)]);
+    }
+    if (!is_null) {
+        const main_buffer: [*]type_data = @alignCast(@ptrCast(self.main_buffer()));
+        // const val: type_data = @as([*]type_data, self.main_buffer())[self.next_index];
+        const val = main_buffer[self.next_index];
+        print("writing non null value {}\n", .{val});
+        const asbytes: [*]u8 = @constCast(@ptrCast(&val));
+        _ = try file.write(asbytes[0..@sizeOf(type_data)]);
     }
 }
 
-fn write_l(self: *Column, file: *std.fs.File) void {
-    write(self, file, formats.l);
+fn write_l(self: *Column, file: *std.fs.File) !void {
+    try write(self, file, formats.l);
 }
-fn write_d(self: *Column, file: *std.fs.File) void {
-    write(self, file, formats.d);
+fn write_d(self: *Column, file: *std.fs.File) !void {
+    try write(self, file, formats.d);
 }
 
 fn write_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
@@ -241,9 +263,8 @@ fn _write_arrow(args: ?*PyObject) !?*PyObject {
     defer file.close();
     for (columns_slice, 0..) |col, i_col| {
         print("i_col({}) {s} {}\n", .{ i_col, col.schema.format, col.current_array.length });
-        // col.bcp_writer(@constCast(&col), &file);
-        col.bcp_info.writer(@constCast(&col), &file);
-        // col.deinit();
+        // col.bcp_info.writer(@constCast(&col), &file);
+        col.bcp_info.writer(@constCast(&col), &file) catch unreachable;
     }
     // _ = file.write("hello");
 
