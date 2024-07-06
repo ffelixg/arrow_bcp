@@ -1,0 +1,8 @@
+*.xml
+*.fmt
+*.dat
+*.n
+**/.zig-cache/**
+*.pyc
+*.so
+*.zon
