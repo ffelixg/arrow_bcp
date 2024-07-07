@@ -14,6 +14,13 @@ const PyModuleDef_Base = py.PyModuleDef_Base;
 const Py_BuildValue = py.Py_BuildValue;
 const PyModule_Create = py.PyModule_Create;
 
+// TODO maybe use?
+// const Buffer = packed struct {
+//     valid_buffer: ?[*]bool,
+//     main_buffer: ?[*]anyopaque,
+//     data_buffer: ?[*]u8,
+// };
+
 const ArrowSchema = packed struct {
     // Array type description
     format: [*:0]const u8,
@@ -37,7 +44,7 @@ const ArrowArray = packed struct {
     offset: i64,
     n_buffers: i64,
     n_children: i64,
-    buffers: [*]?[*]u8,
+    buffers: [*]?*anyopaque,
     children: [*][*]ArrowArray,
     dictionary: [*]ArrowArray,
 
@@ -47,6 +54,7 @@ const ArrowArray = packed struct {
     private_data: ?*anyopaque,
 };
 
+const ArrowError = error{MissingBuffer};
 const Err = error{PyError};
 // const Err = error{ PyError, StopIteration };
 
@@ -84,12 +92,12 @@ const BcpInfo = struct {
 
     fn from_format(fmt: []const u8, nullable: bool) !BcpInfo {
         if (fmt.len == 1) {
-            switch (fmt[0]) {
-                'l' => {
-                    return try BcpInfo.init(write_l, nullable, 64, "SQLBIGINT");
-                },
+            return switch (fmt[0]) {
+                'l' => try BcpInfo.init(write_l, nullable, 64, "SQLBIGINT"),
+                'z' => try BcpInfo.init(write_bytes, 8, 8, "SQLBINARY"),
+                'u' => try BcpInfo.init(write_bytes, 8, 8, "SQLCHAR"),
                 else => unreachable,
-            }
+            };
         } else {
             unreachable;
         }
@@ -133,6 +141,11 @@ const Column = struct {
             py.PyErr_SetString(py.PyExc_Exception, "Offset field is not supported");
             return Err.PyError;
         }
+        if (current_array_ptr.n_buffers < 2) {
+            // TODO add check for data buffer when needed
+            py.PyErr_SetString(py.PyExc_Exception, "Too few buffers");
+            return Err.PyError;
+        }
         self.next_index = 0;
         self.current_array = current_array_ptr.*;
         self._current_array_capsule = py.Py_NewRef(array_capsule);
@@ -148,46 +161,54 @@ const Column = struct {
     }
 
     inline fn valid_buffer(self: *Column) ?[*]bool {
-        return @ptrCast(self.current_array.buffers[0]);
+        return @alignCast(@ptrCast(self.current_array.buffers[0]));
     }
 
-    inline fn main_buffer(self: *Column) *anyopaque {
-        return @ptrCast(self.current_array.buffers[1] orelse unreachable);
+    inline fn main_buffer(self: *Column, tp: type) ![*]tp {
+        return @alignCast(@ptrCast(self.current_array.buffers[1] orelse return ArrowError.MissingBuffer));
+    }
+
+    inline fn data_buffer(self: *Column) ![*]u8 {
+        return @alignCast(@ptrCast(self.current_array.buffers[2] orelse return ArrowError.MissingBuffer));
     }
 };
 
-const formats = enum { l, d };
+const formats = enum { l, d, bytes };
 
 inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) !void {
-    if (format == .d) {
-        print("case1\n", .{});
-    } else {
-        print("case2\n", .{});
-    }
     const types = switch (format) {
         inline formats.l => .{ i64, i8 },
+        inline formats.bytes => .{ u32, i64 },
         else => comptime unreachable,
     };
     const type_data = types[0];
     var is_null: bool = false;
-    if (self.nullable()) {
-        // const is_null = self.null_buffer()[self.next_index];
-        // is_null = if (self.null_buffer()) |nul_buf| nul_buf[self.next_index] else false;
+    const main_buffer = try self.main_buffer(type_data);
+    const nr_bytes: usize = if (format == .bytes)
+        main_buffer[self.next_index + 1] - main_buffer[self.next_index]
+    else
+        @sizeOf(type_data);
+    if (self.nullable() or format == .bytes) {
         if (self.valid_buffer()) |valid_buffer| {
             is_null = !valid_buffer[self.next_index];
         }
         const type_prefix = types[1];
-        const val2: type_prefix = if (is_null) -1 else @sizeOf(type_data);
-        const asbytes2: [*]u8 = @constCast(@ptrCast(&val2));
-        _ = try file.write(asbytes2[0..@sizeOf(type_prefix)]);
+        const val: type_prefix = if (is_null) -1 else @intCast(nr_bytes);
+        const asbytes: [*]u8 = @constCast(@ptrCast(&val));
+        print("writing null\n", .{});
+        _ = try file.write(asbytes[0..@sizeOf(type_prefix)]);
     }
     if (!is_null) {
-        const main_buffer: [*]type_data = @alignCast(@ptrCast(self.main_buffer()));
-        // const val: type_data = @as([*]type_data, self.main_buffer())[self.next_index];
-        const val = main_buffer[self.next_index];
-        print("writing non null value {}\n", .{val});
-        const asbytes: [*]u8 = @constCast(@ptrCast(&val));
-        _ = try file.write(asbytes[0..@sizeOf(type_data)]);
+        if (format == .bytes) {
+            const data_buffer = try self.data_buffer();
+            print("writing string >{s}<\n", .{data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]});
+            _ = try file.write(data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]);
+        } else {
+            const val = main_buffer[self.next_index];
+            print("writing value >{}< at index {}\n", .{ val, self.next_index });
+            const asbytes: [*]u8 = @constCast(@ptrCast(&val));
+            _ = try file.write(asbytes[0..nr_bytes]);
+        }
     }
 }
 
@@ -196,6 +217,9 @@ fn write_l(self: *Column, file: *std.fs.File) !void {
 }
 fn write_d(self: *Column, file: *std.fs.File) !void {
     try write(self, file, formats.d);
+}
+fn write_bytes(self: *Column, file: *std.fs.File) !void {
+    try write(self, file, formats.bytes);
 }
 
 fn write_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
@@ -226,8 +250,6 @@ fn _write_arrow(args: ?*PyObject) !?*PyObject {
     };
     const columns_slice = columns[0..@intCast(nr_columns)];
     for (columns_slice, 0..) |*col, i_col| {
-        print("i_col {}\n", .{i_col});
-
         const capsule_schema = py.PySequence_GetItem(list_schema_capsules, @intCast(i_col)) orelse return Err.PyError;
         defer py.Py_DECREF(capsule_schema);
         const chunk_generator = py.PySequence_GetItem(list_array_capsule_generators, @intCast(i_col)) orelse return Err.PyError;
@@ -253,8 +275,6 @@ fn _write_arrow(args: ?*PyObject) !?*PyObject {
 
         const fmt = col.schema.format[0..std.mem.len(col.schema.format)];
         col.bcp_info = try BcpInfo.from_format(fmt, col.nullable());
-
-        print("i_col {s} {}\n", .{ col.schema.format, col.current_array.length });
     }
     var file = std.fs.createFileAbsoluteZ("/tmp/arrowwrite.dat", .{}) catch {
         py.PyErr_SetString(py.PyExc_Exception, "Error opening file");
@@ -263,16 +283,14 @@ fn _write_arrow(args: ?*PyObject) !?*PyObject {
     defer file.close();
     main_loop: while (true) {
         for (columns_slice, 0..) |*col, i_col| {
-            print("i_col({}) {s} {}\n", .{ i_col, col.schema.format, col.current_array.length });
-            if (col.next_index >= col.current_array.length) {
-                if (!try col.get_next_array()) {
-                    if (i_col != 0) {
+            if (col.next_index >= col.current_array.length and !try col.get_next_array()) {
+                for (columns_slice[i_col + 1 .. columns_slice.len]) |*col_| {
+                    if (i_col != 0 or try col_.get_next_array()) {
                         py.PyErr_SetString(py.PyExc_Exception, "Arrays don't have equal length");
                         return Err.PyError;
-                    } else {
-                        break :main_loop;
                     }
                 }
+                break :main_loop;
             }
             col.bcp_info.writer(col, &file) catch unreachable;
             col.next_index += 1;
