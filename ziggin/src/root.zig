@@ -21,6 +21,13 @@ const PyModule_Create = py.PyModule_Create;
 //     data_buffer: ?[*]u8,
 // };
 
+const Decimal = packed struct {
+    size: u8,
+    precision: u8,
+    sign: i8,
+    int_data: i128,
+};
+
 const ArrowSchema = packed struct {
     // Array type description
     format: [*:0]const u8,
@@ -70,6 +77,8 @@ const BcpInfo = struct {
     bytes_prefix: u16,
     bytes_data: u16,
     dtype_name: [*:0]u8,
+    decimal_size: u8 = 0,
+    decimal_precision: u8 = 0,
 
     fn init(
         writer: @TypeOf(write_l),
@@ -99,6 +108,31 @@ const BcpInfo = struct {
                 else => unreachable,
             };
         } else {
+            if (fmt[0] == 'd') {
+                // Decimal seems to always have the indicator byte
+                var bcp_col = try BcpInfo.init(write_decimal, 1, 19, "SQLDECIMAL");
+                if (fmt[1] != ':') {
+                    py.PyErr_SetString(py.PyExc_Exception, "Expecting ':' as second character of format string whens starting with 'd'");
+                    return Err.PyError;
+                }
+                var iter = std.mem.tokenizeScalar(u8, fmt[2..], ',');
+                bcp_col.decimal_size = try std.fmt.parseInt(u8, iter.next() orelse {
+                    py.PyErr_SetString(py.PyExc_Exception, "Incomplete decimal formatting string");
+                    return Err.PyError;
+                }, 10);
+                bcp_col.decimal_precision = try std.fmt.parseInt(u8, iter.next() orelse {
+                    py.PyErr_SetString(py.PyExc_Exception, "Incomplete decimal formatting string");
+                    return Err.PyError;
+                }, 10);
+                if (iter.next() != null) {
+                    py.PyErr_SetString(py.PyExc_Exception, "Custom bitwidth decimals are not supported.");
+                    return Err.PyError;
+                }
+                print("size {} precision {}\n", .{ bcp_col.decimal_size, bcp_col.decimal_precision });
+                return bcp_col;
+            }
+            print("unreachable format {s}\n", .{fmt});
+            // 'u' => try BcpInfo.init(write_bytes, 8, 8, "SQLCHAR"),
             unreachable;
         }
     }
@@ -173,41 +207,62 @@ const Column = struct {
     }
 };
 
-const formats = enum { l, d, bytes };
+const formats = enum { l, d, bytes, decimal };
 
 inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) !void {
     const types = switch (format) {
-        inline formats.l => .{ i64, i8 },
-        inline formats.bytes => .{ u32, i64 },
+        inline formats.l => .{ i8, i64, i64 },
+        inline formats.bytes => .{ i64, u32, u32 },
+        inline formats.decimal => .{ i8, i128, Decimal },
         else => comptime unreachable,
     };
-    const type_data = types[0];
+    const type_prefix = types[0];
+    const type_arrow = types[1];
+    const type_bcp = types[2];
     var is_null: bool = false;
-    const main_buffer = try self.main_buffer(type_data);
-    const nr_bytes: usize = if (format == .bytes)
-        main_buffer[self.next_index + 1] - main_buffer[self.next_index]
-    else
-        @sizeOf(type_data);
-    if (self.nullable() or format == .bytes) {
+    const main_buffer = try self.main_buffer(type_arrow);
+    const bytes_bcp: usize = switch (format) {
+        .bytes => main_buffer[self.next_index + 1] - main_buffer[self.next_index],
+        .decimal => sizeof: {
+            // Even packed structs can get padded. @sizeOf includes the padding.
+            comptime var sizeof = 0;
+            inline for (@typeInfo(Decimal).Struct.fields) |field| {
+                sizeof += @sizeOf(field.type);
+            }
+            break :sizeof sizeof;
+        },
+        else => @sizeOf(type_bcp),
+    };
+
+    if (self.nullable() or format == .bytes or format == .decimal) {
         if (self.valid_buffer()) |valid_buffer| {
             is_null = !valid_buffer[self.next_index];
         }
-        const type_prefix = types[1];
-        const val: type_prefix = if (is_null) -1 else @intCast(nr_bytes);
-        const asbytes: [*]u8 = @constCast(@ptrCast(&val));
+        const val_null: type_prefix = if (is_null) -1 else @intCast(bytes_bcp);
+        const asbytes: [*]u8 = @constCast(@ptrCast(&val_null));
         print("writing null\n", .{});
         _ = try file.write(asbytes[0..@sizeOf(type_prefix)]);
     }
+
     if (!is_null) {
         if (format == .bytes) {
             const data_buffer = try self.data_buffer();
             print("writing string >{s}<\n", .{data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]});
             _ = try file.write(data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]);
         } else {
-            const val = main_buffer[self.next_index];
-            print("writing value >{}< at index {}\n", .{ val, self.next_index });
-            const asbytes: [*]u8 = @constCast(@ptrCast(&val));
-            _ = try file.write(asbytes[0..nr_bytes]);
+            const val_arrow = main_buffer[self.next_index];
+            const val_bcp = if (format == .decimal)
+                Decimal{
+                    .size = self.bcp_info.decimal_size,
+                    .precision = self.bcp_info.decimal_precision,
+                    .sign = if (val_arrow >= 0) 1 else 0,
+                    .int_data = if (val_arrow >= 0) val_arrow else -val_arrow,
+                }
+            else
+                val_arrow;
+            print("writing value >{}< at index {} with {} bytes\n", .{ val_bcp, self.next_index, bytes_bcp });
+            const asbytes: [*]u8 = @constCast(@ptrCast(&val_bcp));
+            _ = try file.write(asbytes[0..bytes_bcp]);
         }
     }
 }
@@ -220,6 +275,9 @@ fn write_d(self: *Column, file: *std.fs.File) !void {
 }
 fn write_bytes(self: *Column, file: *std.fs.File) !void {
     try write(self, file, formats.bytes);
+}
+fn write_decimal(self: *Column, file: *std.fs.File) !void {
+    try write(self, file, formats.decimal);
 }
 
 fn write_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
