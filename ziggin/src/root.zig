@@ -131,6 +131,9 @@ const BcpInfo = struct {
                 print("size {} precision {}\n", .{ bcp_col.decimal_size, bcp_col.decimal_precision });
                 return bcp_col;
             }
+            if (std.mem.eql(u8, fmt, "tdD")) {
+                return try BcpInfo.init(write_date, nullable, 3, "SQLDATE");
+            }
             print("unreachable format {s}\n", .{fmt});
             // 'u' => try BcpInfo.init(write_bytes, 8, 8, "SQLCHAR"),
             unreachable;
@@ -207,13 +210,14 @@ const Column = struct {
     }
 };
 
-const formats = enum { l, d, bytes, decimal };
+const formats = enum { l, d, bytes, decimal, date };
 
 inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) !void {
     const types = switch (format) {
         inline formats.l => .{ i8, i64, i64 },
         inline formats.bytes => .{ i64, u32, u32 },
         inline formats.decimal => .{ i8, i128, Decimal },
+        inline formats.date => .{ i8, i32, i24 },
         else => comptime unreachable,
     };
     const type_prefix = types[0];
@@ -222,16 +226,8 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) !vo
     var is_null: bool = false;
     const main_buffer = try self.main_buffer(type_arrow);
     const bytes_bcp: usize = switch (format) {
-        .bytes => main_buffer[self.next_index + 1] - main_buffer[self.next_index],
-        .decimal => sizeof: {
-            // Even packed structs can get padded. @sizeOf includes the padding.
-            comptime var sizeof = 0;
-            inline for (@typeInfo(Decimal).Struct.fields) |field| {
-                sizeof += @sizeOf(field.type);
-            }
-            break :sizeof sizeof;
-        },
-        else => @sizeOf(type_bcp),
+        inline .bytes => main_buffer[self.next_index + 1] - main_buffer[self.next_index],
+        inline else => @bitSizeOf(type_bcp) / 8,
     };
 
     if (self.nullable() or format == .bytes or format == .decimal) {
@@ -244,26 +240,34 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) !vo
         _ = try file.write(asbytes[0..@sizeOf(type_prefix)]);
     }
 
-    if (!is_null) {
-        if (format == .bytes) {
-            const data_buffer = try self.data_buffer();
-            print("writing string >{s}<\n", .{data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]});
-            _ = try file.write(data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]);
-        } else {
-            const val_arrow = main_buffer[self.next_index];
-            const val_bcp = if (format == .decimal)
-                Decimal{
-                    .size = self.bcp_info.decimal_size,
-                    .precision = self.bcp_info.decimal_precision,
-                    .sign = if (val_arrow >= 0) 1 else 0,
-                    .int_data = if (val_arrow >= 0) val_arrow else -val_arrow,
-                }
-            else
-                val_arrow;
-            print("writing value >{}< at index {} with {} bytes\n", .{ val_bcp, self.next_index, bytes_bcp });
-            const asbytes: [*]u8 = @constCast(@ptrCast(&val_bcp));
-            _ = try file.write(asbytes[0..bytes_bcp]);
-        }
+    if (is_null) {
+        return;
+    }
+
+    if (format == .bytes) {
+        const data_buffer = try self.data_buffer();
+        print("writing string >{s}<\n", .{data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]});
+        _ = try file.write(data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]);
+    } else {
+        const val_arrow = main_buffer[self.next_index];
+        const val_bcp = switch (format) {
+            .decimal => Decimal{
+                .size = self.bcp_info.decimal_size,
+                .precision = self.bcp_info.decimal_precision,
+                .sign = if (val_arrow >= 0) 1 else 0,
+                .int_data = if (val_arrow >= 0) val_arrow else -val_arrow,
+            },
+            // TODO raise PyError when it fails
+            .date => br: {
+                const x: type_bcp = @intCast(val_arrow + 719163 - 1);
+                // @as(type_bcp, val_arrow + 719163 - 1),
+                break :br x;
+            },
+            else => val_arrow,
+        };
+        print("writing value >{}< at index {} with {} bytes\n", .{ val_bcp, self.next_index, bytes_bcp });
+        const asbytes: [*]u8 = @constCast(@ptrCast(&val_bcp));
+        _ = try file.write(asbytes[0..bytes_bcp]);
     }
 }
 
@@ -278,6 +282,9 @@ fn write_bytes(self: *Column, file: *std.fs.File) !void {
 }
 fn write_decimal(self: *Column, file: *std.fs.File) !void {
     try write(self, file, formats.decimal);
+}
+fn write_date(self: *Column, file: *std.fs.File) !void {
+    try write(self, file, formats.date);
 }
 
 fn write_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
