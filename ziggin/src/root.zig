@@ -28,6 +28,20 @@ const Decimal = packed struct {
     int_data: i128,
 };
 
+const DateTime64 = packed struct {
+    time: u40,
+    date: u24,
+
+    inline fn from_ns_factor(val: i64, ns_factor: i64) DateTime64 {
+        const as_ns = val * ns_factor;
+        const ns_in_day = 1000 * 1000 * 1000 * 60 * 60 * 24;
+        return DateTime64{
+            .date = @intCast(@divFloor(as_ns, ns_in_day) + 719162),
+            .time = @intCast(@divFloor(@mod(as_ns, ns_in_day), 100)),
+        };
+    }
+};
+
 const ArrowSchema = packed struct {
     // Array type description
     format: [*:0]const u8,
@@ -79,6 +93,8 @@ const BcpInfo = struct {
     dtype_name: [*:0]u8,
     decimal_size: u8 = 0,
     decimal_precision: u8 = 0,
+    timestamp_timezone: ?[]const u8 = null,
+    timestamp_factor_ns: i64 = 0,
 
     fn init(
         writer: @TypeOf(write_l),
@@ -110,17 +126,17 @@ const BcpInfo = struct {
         } else {
             if (fmt[0] == 'd') {
                 // Decimal seems to always have the indicator byte
-                var bcp_col = try BcpInfo.init(write_decimal, 1, 19, "SQLDECIMAL");
+                var bcp_info = try BcpInfo.init(write_decimal, 1, 19, "SQLDECIMAL");
                 if (fmt[1] != ':') {
                     py.PyErr_SetString(py.PyExc_Exception, "Expecting ':' as second character of format string whens starting with 'd'");
                     return Err.PyError;
                 }
                 var iter = std.mem.tokenizeScalar(u8, fmt[2..], ',');
-                bcp_col.decimal_size = try std.fmt.parseInt(u8, iter.next() orelse {
+                bcp_info.decimal_size = try std.fmt.parseInt(u8, iter.next() orelse {
                     py.PyErr_SetString(py.PyExc_Exception, "Incomplete decimal formatting string");
                     return Err.PyError;
                 }, 10);
-                bcp_col.decimal_precision = try std.fmt.parseInt(u8, iter.next() orelse {
+                bcp_info.decimal_precision = try std.fmt.parseInt(u8, iter.next() orelse {
                     py.PyErr_SetString(py.PyExc_Exception, "Incomplete decimal formatting string");
                     return Err.PyError;
                 }, 10);
@@ -128,11 +144,38 @@ const BcpInfo = struct {
                     py.PyErr_SetString(py.PyExc_Exception, "Custom bitwidth decimals are not supported.");
                     return Err.PyError;
                 }
-                print("size {} precision {}\n", .{ bcp_col.decimal_size, bcp_col.decimal_precision });
-                return bcp_col;
+                print("size {} precision {}\n", .{ bcp_info.decimal_size, bcp_info.decimal_precision });
+                return bcp_info;
             }
             if (std.mem.eql(u8, fmt, "tdD")) {
                 return try BcpInfo.init(write_date, nullable, 3, "SQLDATE");
+            }
+            if (std.mem.eql(u8, fmt, "tdm")) {
+                return try BcpInfo.init(write_datetime, nullable, 3, "SQLDATETIME2");
+            }
+            if (std.mem.eql(u8, fmt[0..2], "ts")) {
+                if (fmt[3] != ':') {
+                    py.PyErr_SetString(py.PyExc_Exception, "Expecting ':' as fourth character of timestamp format string");
+                    return Err.PyError;
+                }
+                const timezone = fmt[4..];
+                var bcp_info = try BcpInfo.init(write_timestamp, nullable, if (timezone.len > 0) 10 else 8, "SQLDATETIME2");
+                bcp_info.timestamp_timezone = timezone;
+                bcp_info.timestamp_factor_ns = switch (fmt[2]) {
+                    'n' => 1,
+                    'u' => 1000,
+                    'm' => 1000 * 1000,
+                    's' => 1000 * 1000 * 1000,
+                    else => {
+                        py.PyErr_SetString(py.PyExc_Exception, "Expected timestamp with seconds/ms/us/ns as precision");
+                        return Err.PyError;
+                    },
+                };
+                if (timezone.len > 1) {
+                    print("timestamp timezone {s}\n", .{fmt});
+                    unreachable;
+                }
+                return bcp_info;
             }
             print("unreachable format {s}\n", .{fmt});
             // 'u' => try BcpInfo.init(write_bytes, 8, 8, "SQLCHAR"),
@@ -210,14 +253,16 @@ const Column = struct {
     }
 };
 
-const formats = enum { l, d, bytes, decimal, date };
+const formats = enum { l, d, bytes, decimal, date, datetime, timestamp };
 
 inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) !void {
     const types = switch (format) {
         inline formats.l => .{ i8, i64, i64 },
         inline formats.bytes => .{ i64, u32, u32 },
         inline formats.decimal => .{ i8, i128, Decimal },
-        inline formats.date => .{ i8, i32, i24 },
+        inline formats.date => .{ i8, i32, u24 },
+        inline formats.datetime => .{ i8, i64, DateTime64 },
+        inline formats.timestamp => .{ i8, i64, DateTime64 },
         else => comptime unreachable,
     };
     const type_prefix = types[0];
@@ -259,10 +304,12 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) !vo
             },
             // TODO raise PyError when it fails
             .date => br: {
-                const x: type_bcp = @intCast(val_arrow + 719163 - 1);
+                const x: type_bcp = @intCast(val_arrow + 719162);
                 // @as(type_bcp, val_arrow + 719163 - 1),
                 break :br x;
             },
+            .datetime => DateTime64.from_ns_factor(val_arrow, 1000 * 1000),
+            .timestamp => DateTime64.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns),
             else => val_arrow,
         };
         print("writing value >{}< at index {} with {} bytes\n", .{ val_bcp, self.next_index, bytes_bcp });
@@ -285,6 +332,12 @@ fn write_decimal(self: *Column, file: *std.fs.File) !void {
 }
 fn write_date(self: *Column, file: *std.fs.File) !void {
     try write(self, file, formats.date);
+}
+fn write_datetime(self: *Column, file: *std.fs.File) !void {
+    try write(self, file, formats.datetime);
+}
+fn write_timestamp(self: *Column, file: *std.fs.File) !void {
+    try write(self, file, formats.timestamp);
 }
 
 fn write_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
