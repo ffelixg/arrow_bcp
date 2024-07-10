@@ -92,7 +92,24 @@ const ArrowArray = packed struct {
 
 const ArrowError = error{MissingBuffer};
 const Err = error{PyError};
-// const Err = error{ PyError, StopIteration };
+const Exceptions = enum { Exception, NotImplemented, TypeError };
+
+fn raise_args(exc: Exceptions, comptime msg: []const u8, args: anytype) Err {
+    @setCold(true);
+    const pyexc = switch (exc) {
+        .Exception => py.PyExc_Exception,
+        .NotImplemented => py.PyExc_NotImplementedError,
+        .TypeError => py.PyExc_TypeError,
+    };
+    const formatted = std.fmt.allocPrintZ(allocator, msg, args) catch "Error formatting error message";
+    defer allocator.free(formatted);
+    py.PyErr_SetString(pyexc, formatted.ptr);
+    return Err.PyError;
+}
+
+fn raise(exc: Exceptions, comptime msg: []const u8) Err {
+    return raise_args(exc, msg, .{});
+}
 
 var gpa = std.heap.GeneralPurposeAllocator(.{
     .safety = true,
@@ -105,7 +122,7 @@ const BcpInfo = struct {
     writer: @TypeOf(&write_l),
     bytes_prefix: u16,
     bytes_data: u16,
-    dtype_name: [*:0]u8,
+    dtype_name: []u8,
     decimal_size: u8 = 0,
     decimal_precision: u8 = 0,
     timestamp_timezone_offset: i16 = 0,
@@ -122,7 +139,7 @@ const BcpInfo = struct {
             // .bytes_prefix = bytes_prefix,
             .bytes_prefix = if (@TypeOf(bytes_prefix) == bool) @intFromBool(bytes_prefix) else bytes_prefix,
             .bytes_data = bytes_data,
-            .dtype_name = try std.fmt.allocPrintZ(allocator, dtype_name, .{}),
+            .dtype_name = try std.fmt.allocPrint(allocator, dtype_name, .{}),
         };
     }
 
@@ -136,30 +153,25 @@ const BcpInfo = struct {
                 'l' => try BcpInfo.init(write_l, nullable, 64, "SQLBIGINT"),
                 'z' => try BcpInfo.init(write_bytes, 8, 8, "SQLBINARY"),
                 'u' => try BcpInfo.init(write_bytes, 8, 8, "SQLCHAR"),
-                else => unreachable,
+                else => raise_args(.NotImplemented, "Format '{s}' not implemented", .{fmt}),
             };
         } else {
             if (fmt[0] == 'd') {
                 // Decimal seems to always have the indicator byte
                 var bcp_info = try BcpInfo.init(write_decimal, 1, 19, "SQLDECIMAL");
                 if (fmt[1] != ':') {
-                    py.PyErr_SetString(py.PyExc_Exception, "Expecting ':' as second character of format string whens starting with 'd'");
-                    return Err.PyError;
+                    return raise_args(.TypeError, "Expecting ':' as second character of decimal format string '{s}'", .{fmt});
                 }
                 var iter = std.mem.tokenizeScalar(u8, fmt[2..], ',');
                 bcp_info.decimal_size = try std.fmt.parseInt(u8, iter.next() orelse {
-                    py.PyErr_SetString(py.PyExc_Exception, "Incomplete decimal formatting string");
-                    return Err.PyError;
+                    return raise_args(.TypeError, "Incomplete decimal format string '{s}'", .{fmt});
                 }, 10);
                 bcp_info.decimal_precision = try std.fmt.parseInt(u8, iter.next() orelse {
-                    py.PyErr_SetString(py.PyExc_Exception, "Incomplete decimal formatting string");
-                    return Err.PyError;
+                    return raise_args(.TypeError, "Incomplete decimal format string '{s}'", .{fmt});
                 }, 10);
                 if (iter.next() != null) {
-                    py.PyErr_SetString(py.PyExc_Exception, "Custom bitwidth decimals are not supported.");
-                    return Err.PyError;
+                    return raise(.NotImplemented, "Non 128 bit decimals are not supported");
                 }
-                print("size {} precision {}\n", .{ bcp_info.decimal_size, bcp_info.decimal_precision });
                 return bcp_info;
             }
             if (std.mem.eql(u8, fmt, "tdD")) {
@@ -170,8 +182,7 @@ const BcpInfo = struct {
             }
             if (std.mem.eql(u8, fmt[0..2], "ts")) {
                 if (fmt[3] != ':') {
-                    py.PyErr_SetString(py.PyExc_Exception, "Expecting ':' as fourth character of timestamp format string");
-                    return Err.PyError;
+                    return raise_args(.TypeError, "Expecting ':' as fourth character of timestamp format string '{s}'", .{fmt});
                 }
                 const timezone = fmt[4..];
                 const factor_ns: i64 = switch (fmt[2]) {
@@ -180,8 +191,7 @@ const BcpInfo = struct {
                     'm' => 1000 * 1000,
                     's' => 1000 * 1000 * 1000,
                     else => {
-                        py.PyErr_SetString(py.PyExc_Exception, "Expected timestamp with seconds/ms/us/ns as precision");
-                        return Err.PyError;
+                        return raise(.TypeError, "Expected timestamp with seconds/ms/us/ns as precision");
                     },
                 };
                 if (timezone.len == 0) {
@@ -195,29 +205,24 @@ const BcpInfo = struct {
                         '+' => 1,
                         '-' => -1,
                         else => {
-                            py.PyErr_SetString(py.PyExc_Exception, "Invalid timezone sign");
-                            return Err.PyError;
+                            return raise_args(.TypeError, "Invalid timezone sign for format string '{s}'", .{fmt});
                         },
                     };
                     var iter = std.mem.tokenizeScalar(u8, timezone[1..], ':');
                     const hours = try std.fmt.parseInt(i16, iter.next() orelse {
-                        py.PyErr_SetString(py.PyExc_Exception, "Error parsing timezone hour");
-                        return Err.PyError;
+                        return raise_args(.TypeError, "Error parsing timezone hour for format string '{s}'", .{fmt});
                     }, 10);
                     const minutes = try std.fmt.parseInt(i16, iter.next() orelse {
-                        py.PyErr_SetString(py.PyExc_Exception, "Error parsing timezone minute");
-                        return Err.PyError;
+                        return raise_args(.TypeError, "Error parsing timezone minute for format string '{s}'", .{fmt});
                     }, 10);
                     if (iter.next() != null) {
-                        py.PyErr_SetString(py.PyExc_Exception, "Invalid timestamp format string");
-                        return Err.PyError;
+                        return raise_args(.TypeError, "Invalid timestamp format string '{s}'", .{fmt});
                     }
                     bcp_info.timestamp_timezone_offset = sign * (hours * 60 + minutes);
                     return bcp_info;
                 }
             }
-            print("unreachable format {s}\n", .{fmt});
-            unreachable;
+            return raise_args(.NotImplemented, "Format '{s}' not implemented", .{fmt});
         }
     }
 };
@@ -237,7 +242,7 @@ const Column = struct {
         py.Py_DECREF(self._schema_capsule);
         py.Py_DECREF(self._chunk_generator);
         py.Py_XDECREF(self._current_array_capsule);
-        // self.bcp_info.deinit(); // TODO ??
+        self.bcp_info.deinit(); // TODO ??
     }
 
     fn get_next_array(self: *Column) !bool {
@@ -256,13 +261,11 @@ const Column = struct {
         const array_ptr = py.PyCapsule_GetPointer(array_capsule, "arrow_array") orelse return Err.PyError;
         const current_array_ptr: *ArrowArray = @alignCast(@ptrCast(array_ptr));
         if (current_array_ptr.offset != 0) {
-            py.PyErr_SetString(py.PyExc_Exception, "Offset field is not supported");
-            return Err.PyError;
+            return raise(.NotImplemented, "ArrowArray offset field is not supported");
         }
-        if (current_array_ptr.n_buffers < 2) {
+        if (current_array_ptr.n_buffers < 2 and current_array_ptr.length > 0) {
             // TODO add check for data buffer when needed
-            py.PyErr_SetString(py.PyExc_Exception, "Too few buffers");
-            return Err.PyError;
+            return raise(.Exception, "Too few buffers");
         }
         self.next_index = 0;
         self.current_array = current_array_ptr.*;
@@ -344,7 +347,6 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) !vo
             // TODO raise PyError when it fails
             .date => br: {
                 const x: type_bcp = @intCast(val_arrow + 719162);
-                // @as(type_bcp, val_arrow + 719163 - 1),
                 break :br x;
             },
             .datetime => DateTime64.from_ns_factor(val_arrow, 1000 * 1000),
@@ -430,16 +432,14 @@ fn _write_arrow(args: ?*PyObject) !?*PyObject {
         n_allocated_columns += 1;
 
         if (!try col.get_next_array()) {
-            py.PyErr_SetString(py.PyExc_Exception, "Expecting at least one array chunk");
-            return Err.PyError;
+            return raise(.Exception, "Expecting at least one array chunk");
         }
 
         const fmt = col.schema.format[0..std.mem.len(col.schema.format)];
         col.bcp_info = try BcpInfo.from_format(fmt, col.nullable());
     }
     var file = std.fs.createFileAbsoluteZ("/tmp/arrowwrite.dat", .{}) catch {
-        py.PyErr_SetString(py.PyExc_Exception, "Error opening file");
-        return Err.PyError;
+        return raise(.Exception, "Error opening file");
     };
     defer file.close();
     main_loop: while (true) {
@@ -447,8 +447,7 @@ fn _write_arrow(args: ?*PyObject) !?*PyObject {
             if (col.next_index >= col.current_array.length and !try col.get_next_array()) {
                 for (columns_slice[i_col + 1 .. columns_slice.len]) |*col_| {
                     if (i_col != 0 or try col_.get_next_array()) {
-                        py.PyErr_SetString(py.PyExc_Exception, "Arrays don't have equal length");
-                        return Err.PyError;
+                        return raise(.Exception, "Arrays don't have equal length");
                     }
                 }
                 break :main_loop;
