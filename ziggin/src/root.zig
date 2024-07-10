@@ -42,6 +42,21 @@ const DateTime64 = packed struct {
     }
 };
 
+const DateTimeOffset = packed struct {
+    time: u40,
+    date: u24,
+    offset: i16,
+
+    inline fn from_ns_factor(val: i64, ns_factor: i64, offset: i16) DateTimeOffset {
+        const dt64 = DateTime64.from_ns_factor(val, ns_factor);
+        return DateTimeOffset{
+            .time = dt64.time,
+            .date = dt64.date,
+            .offset = offset,
+        };
+    }
+};
+
 const ArrowSchema = packed struct {
     // Array type description
     format: [*:0]const u8,
@@ -93,7 +108,7 @@ const BcpInfo = struct {
     dtype_name: [*:0]u8,
     decimal_size: u8 = 0,
     decimal_precision: u8 = 0,
-    timestamp_timezone: ?[]const u8 = null,
+    timestamp_timezone_offset: i16 = 0,
     timestamp_factor_ns: i64 = 0,
 
     fn init(
@@ -159,9 +174,7 @@ const BcpInfo = struct {
                     return Err.PyError;
                 }
                 const timezone = fmt[4..];
-                var bcp_info = try BcpInfo.init(write_timestamp, nullable, if (timezone.len > 0) 10 else 8, "SQLDATETIME2");
-                bcp_info.timestamp_timezone = timezone;
-                bcp_info.timestamp_factor_ns = switch (fmt[2]) {
+                const factor_ns: i64 = switch (fmt[2]) {
                     'n' => 1,
                     'u' => 1000,
                     'm' => 1000 * 1000,
@@ -171,14 +184,39 @@ const BcpInfo = struct {
                         return Err.PyError;
                     },
                 };
-                if (timezone.len > 1) {
-                    print("timestamp timezone {s}\n", .{fmt});
-                    unreachable;
+                if (timezone.len == 0) {
+                    var bcp_info = try BcpInfo.init(write_timestamp, nullable, 8, "SQLDATETIME2");
+                    bcp_info.timestamp_factor_ns = factor_ns;
+                    return bcp_info;
+                } else {
+                    var bcp_info = try BcpInfo.init(write_timestamp_timezone, nullable, 10, "SQLDATETIMEOFFSET");
+                    bcp_info.timestamp_factor_ns = factor_ns;
+                    const sign: i16 = switch (timezone[0]) {
+                        '+' => 1,
+                        '-' => -1,
+                        else => {
+                            py.PyErr_SetString(py.PyExc_Exception, "Invalid timezone sign");
+                            return Err.PyError;
+                        },
+                    };
+                    var iter = std.mem.tokenizeScalar(u8, timezone[1..], ':');
+                    const hours = try std.fmt.parseInt(i16, iter.next() orelse {
+                        py.PyErr_SetString(py.PyExc_Exception, "Error parsing timezone hour");
+                        return Err.PyError;
+                    }, 10);
+                    const minutes = try std.fmt.parseInt(i16, iter.next() orelse {
+                        py.PyErr_SetString(py.PyExc_Exception, "Error parsing timezone minute");
+                        return Err.PyError;
+                    }, 10);
+                    if (iter.next() != null) {
+                        py.PyErr_SetString(py.PyExc_Exception, "Invalid timestamp format string");
+                        return Err.PyError;
+                    }
+                    bcp_info.timestamp_timezone_offset = sign * (hours * 60 + minutes);
+                    return bcp_info;
                 }
-                return bcp_info;
             }
             print("unreachable format {s}\n", .{fmt});
-            // 'u' => try BcpInfo.init(write_bytes, 8, 8, "SQLCHAR"),
             unreachable;
         }
     }
@@ -253,7 +291,7 @@ const Column = struct {
     }
 };
 
-const formats = enum { l, d, bytes, decimal, date, datetime, timestamp };
+const formats = enum { l, d, bytes, decimal, date, datetime, timestamp, timestamp_timezone };
 
 inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) !void {
     const types = switch (format) {
@@ -263,6 +301,7 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) !vo
         inline formats.date => .{ i8, i32, u24 },
         inline formats.datetime => .{ i8, i64, DateTime64 },
         inline formats.timestamp => .{ i8, i64, DateTime64 },
+        inline formats.timestamp_timezone => .{ i8, i64, DateTimeOffset },
         else => comptime unreachable,
     };
     const type_prefix = types[0];
@@ -310,6 +349,7 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) !vo
             },
             .datetime => DateTime64.from_ns_factor(val_arrow, 1000 * 1000),
             .timestamp => DateTime64.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns),
+            .timestamp_timezone => DateTimeOffset.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns, self.bcp_info.timestamp_timezone_offset),
             else => val_arrow,
         };
         print("writing value >{}< at index {} with {} bytes\n", .{ val_bcp, self.next_index, bytes_bcp });
@@ -338,6 +378,9 @@ fn write_datetime(self: *Column, file: *std.fs.File) !void {
 }
 fn write_timestamp(self: *Column, file: *std.fs.File) !void {
     try write(self, file, formats.timestamp);
+}
+fn write_timestamp_timezone(self: *Column, file: *std.fs.File) !void {
+    try write(self, file, formats.timestamp_timezone);
 }
 
 fn write_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
