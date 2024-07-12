@@ -120,8 +120,7 @@ const allocator = gpa.allocator();
 
 const BcpInfo = struct {
     writer: writer_type,
-    bytes_prefix: u16,
-    bytes_data: u16,
+    format: formats,
     dtype_name: []u8,
     decimal_size: u8 = 0,
     decimal_precision: u8 = 0,
@@ -130,15 +129,11 @@ const BcpInfo = struct {
 
     fn init(
         format: formats,
-        bytes_prefix: anytype,
-        bytes_data: u16,
         comptime dtype_name: []const u8,
     ) !BcpInfo {
         return BcpInfo{
-            .writer = @constCast(get_writer(format)),
-            // .bytes_prefix = bytes_prefix,
-            .bytes_prefix = if (@TypeOf(bytes_prefix) == bool) @intFromBool(bytes_prefix) else bytes_prefix,
-            .bytes_data = bytes_data,
+            .writer = writers.get(format),
+            .format = format,
             .dtype_name = try std.fmt.allocPrint(allocator, dtype_name, .{}),
         };
     }
@@ -147,18 +142,18 @@ const BcpInfo = struct {
         allocator.free(self.dtype_name);
     }
 
-    fn from_format(fmt: []const u8, nullable: bool) !BcpInfo {
+    fn from_format(fmt: []const u8) !BcpInfo {
         if (fmt.len == 1) {
             return switch (fmt[0]) {
-                'l' => try BcpInfo.init(.l, nullable, 64, "SQLBIGINT"),
-                'z' => try BcpInfo.init(.bytes, 8, 8, "SQLBINARY"),
-                'u' => try BcpInfo.init(.bytes, 8, 8, "SQLCHAR"),
+                'l' => try BcpInfo.init(.l, "SQLBIGINT"),
+                'z' => try BcpInfo.init(.bytes, "SQLBINARY"),
+                'u' => try BcpInfo.init(.bytes, "SQLCHAR"),
                 else => raise_args(.NotImplemented, "Format '{s}' not implemented", .{fmt}),
             };
         } else {
             if (fmt[0] == 'd') {
                 // Decimal seems to always have the indicator byte
-                var bcp_info = try BcpInfo.init(.decimal, 1, 19, "SQLDECIMAL");
+                var bcp_info = try BcpInfo.init(.decimal, "SQLDECIMAL");
                 if (fmt[1] != ':') {
                     return raise_args(.TypeError, "Expecting ':' as second character of decimal format string '{s}'", .{fmt});
                 }
@@ -175,10 +170,10 @@ const BcpInfo = struct {
                 return bcp_info;
             }
             if (std.mem.eql(u8, fmt, "tdD")) {
-                return try BcpInfo.init(.date, nullable, 3, "SQLDATE");
+                return try BcpInfo.init(.date, "SQLDATE");
             }
             if (std.mem.eql(u8, fmt, "tdm")) {
-                return try BcpInfo.init(.datetime, nullable, 8, "SQLDATETIME2");
+                return try BcpInfo.init(.datetime, "SQLDATETIME2");
             }
             if (std.mem.eql(u8, fmt[0..2], "ts")) {
                 if (fmt[3] != ':') {
@@ -195,11 +190,11 @@ const BcpInfo = struct {
                     },
                 };
                 if (timezone.len == 0) {
-                    var bcp_info = try BcpInfo.init(.timestamp, nullable, 8, "SQLDATETIME2");
+                    var bcp_info = try BcpInfo.init(.timestamp, "SQLDATETIME2");
                     bcp_info.timestamp_factor_ns = factor_ns;
                     return bcp_info;
                 } else {
-                    var bcp_info = try BcpInfo.init(.timestamp_timezone, nullable, 10, "SQLDATETIMEOFFSET");
+                    var bcp_info = try BcpInfo.init(.timestamp_timezone, "SQLDATETIMEOFFSET");
                     bcp_info.timestamp_factor_ns = factor_ns;
                     const sign: i16 = switch (timezone[0]) {
                         '+' => 1,
@@ -297,7 +292,7 @@ const Column = struct {
 const formats = enum(i64) { l, bytes, decimal, date, datetime, timestamp, timestamp_timezone };
 const WriteError = error{ write_error, missing_buffer };
 
-inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) WriteError!void {
+inline fn format_types(comptime format: formats) struct { prefix: type, arrow: type, bcp: type } {
     const types = switch (format) {
         inline formats.l => .{ i8, i64, i64 },
         inline formats.bytes => .{ i64, u32, u32 },
@@ -307,24 +302,45 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) Wri
         inline formats.timestamp => .{ i8, i64, DateTime64 },
         inline formats.timestamp_timezone => .{ i8, i64, DateTimeOffset },
     };
-    const type_prefix = types[0];
-    const type_arrow = types[1];
-    const type_bcp = types[2];
+    return .{
+        .prefix = types[0],
+        .arrow = types[1],
+        .bcp = types[2],
+    };
+}
+
+const format_sizes = blk: {
+    const size = struct { prefix: usize, arrow: usize, bcp: usize };
+
+    var arr = std.EnumArray(formats, size).initUndefined();
+    for (std.enums.values(formats)) |fmt| {
+        const types = format_types(fmt);
+        arr.set(fmt, size{
+            .prefix = @divExact(@bitSizeOf(types.prefix), 8),
+            .arrow = @divExact(@bitSizeOf(types.arrow), 8),
+            .bcp = @divExact(@bitSizeOf(types.bcp), 8),
+        });
+    }
+
+    break :blk arr;
+};
+
+inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) WriteError!void {
+    const types = format_types(format);
     var is_null: bool = false;
-    const main_buffer = try self.main_buffer(type_arrow);
+    const main_buffer = try self.main_buffer(types.arrow);
     const bytes_bcp: usize = switch (format) {
         inline .bytes => main_buffer[self.next_index + 1] - main_buffer[self.next_index],
-        inline else => @bitSizeOf(type_bcp) / 8,
+        inline else => @bitSizeOf(types.bcp) / 8,
     };
 
     if (self.nullable() or format == .bytes or format == .decimal) {
         if (self.valid_buffer()) |valid_buffer| {
             is_null = !valid_buffer[self.next_index];
         }
-        const val_null: type_prefix = if (is_null) -1 else @intCast(bytes_bcp);
+        const val_null: types.prefix = if (is_null) -1 else @intCast(bytes_bcp);
         const asbytes: [*]u8 = @constCast(@ptrCast(&val_null));
-        print("writing null\n", .{});
-        _ = file.write(asbytes[0..@sizeOf(type_prefix)]) catch return WriteError.write_error;
+        _ = file.write(asbytes[0..@sizeOf(types.prefix)]) catch return WriteError.write_error;
     }
 
     if (is_null) {
@@ -346,7 +362,7 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) Wri
             },
             // TODO raise PyError when it fails
             .date => br: {
-                const x: type_bcp = @intCast(val_arrow + 719162);
+                const x: types.bcp = @intCast(val_arrow + 719162);
                 break :br x;
             },
             .datetime => DateTime64.from_ns_factor(val_arrow, 1000 * 1000),
@@ -362,33 +378,17 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) Wri
 
 const writer_type = *fn (*Column, *std.fs.File) @typeInfo(@TypeOf(write)).Fn.return_type.?;
 
-var writers = blk: {
-    const fields = @typeInfo(formats).Enum.fields;
-    var arr: [fields.len]writer_struct = .{undefined} ** fields.len;
-    for (fields, 0..) |fmt_name, i_field| {
-        const fmt: formats = @enumFromInt(fmt_name.value);
+const writers = blk: {
+    var arr = std.EnumArray(formats, writer_type).initUndefined();
+    for (std.enums.values(formats)) |fmt| {
         const dummy = struct {
             fn write_fmt(self: *Column, file: *std.fs.File) !void {
                 try write(self, file, fmt);
             }
         };
-        arr[i_field] = writer_struct{ .format = fmt, .writer = @constCast(&dummy.write_fmt) };
+        arr.set(fmt, @constCast(&dummy.write_fmt));
     }
     break :blk arr;
-};
-
-fn get_writer(fmt: formats) writer_type {
-    for (writers) |w| {
-        if (w.format == fmt) {
-            return w.writer;
-        }
-    }
-    unreachable;
-}
-
-const writer_struct = struct {
-    format: formats,
-    writer: writer_type,
 };
 
 fn write_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
@@ -442,7 +442,7 @@ fn _write_arrow(args: ?*PyObject) !?*PyObject {
         }
 
         const fmt = col.schema.format[0..std.mem.len(col.schema.format)];
-        col.bcp_info = try BcpInfo.from_format(fmt, col.nullable());
+        col.bcp_info = try BcpInfo.from_format(fmt);
     }
     var file = std.fs.createFileAbsoluteZ("/tmp/arrowwrite.dat", .{}) catch {
         return raise(.Exception, "Error opening file");
@@ -462,11 +462,31 @@ fn _write_arrow(args: ?*PyObject) !?*PyObject {
             col.next_index += 1;
         }
     }
-    // _ = file.write("hello");
 
-    // return py.PyLong_FromSize_t(columns_slice.len);
-    return py.PyLong_FromSize_t(columns.len);
-    // return py.Py_NewRef(py.Py_None());
+    const format_list = py.PyList_New(0) orelse return Err.PyError;
+    errdefer py.Py_DECREF(format_list);
+    for (columns_slice) |*col| {
+        const sizes = format_sizes.get(col.bcp_info.format);
+        const format_tuple = py.PyTuple_New(3);
+        errdefer py.Py_DECREF(format_tuple);
+
+        const str_ptr: [*c]u8 = col.bcp_info.dtype_name.ptr;
+        const str_len: py.Py_ssize_t = @intCast(col.bcp_info.dtype_name.len);
+        if (py.PyTuple_SetItem(format_tuple, 0, py.PyUnicode_FromStringAndSize(str_ptr, str_len) orelse return Err.PyError) == -1) {
+            return Err.PyError;
+        }
+        if (py.PyTuple_SetItem(format_tuple, 1, py.PyLong_FromUnsignedLongLong(@as(c_ulonglong, sizes.prefix)) orelse return Err.PyError) == -1) {
+            return Err.PyError;
+        }
+        if (py.PyTuple_SetItem(format_tuple, 2, py.PyLong_FromUnsignedLongLong(@as(c_ulonglong, sizes.bcp)) orelse return Err.PyError) == -1) {
+            return Err.PyError;
+        }
+
+        if (py.PyList_Append(format_list, format_tuple) == -1) {
+            return Err.PyError;
+        }
+    }
+    return format_list;
 }
 
 // fn zaml_load(self: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
