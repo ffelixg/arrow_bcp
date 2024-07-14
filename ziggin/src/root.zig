@@ -145,7 +145,18 @@ const BcpInfo = struct {
     fn from_format(fmt: []const u8) !BcpInfo {
         if (fmt.len == 1) {
             return switch (fmt[0]) {
-                'l' => try BcpInfo.init(.l, "SQLBIGINT"),
+                'b' => try BcpInfo.init(.boolean, "SQLBIT"),
+                'c' => try BcpInfo.init(.int8, "SQLSMALLINT"),
+                'C' => try BcpInfo.init(.uint8, "SQLTINYINT"),
+                's' => try BcpInfo.init(.int16, "SQLSMALLINT"),
+                'S' => try BcpInfo.init(.uint16, "SQLINT"),
+                'i' => try BcpInfo.init(.int32, "SQLINT"),
+                'I' => try BcpInfo.init(.uint32, "SQLBIGINT"),
+                'l' => try BcpInfo.init(.int64, "SQLBIGINT"),
+                'L' => try BcpInfo.init(.uint64, "SQLDECIMAL"),
+                'e' => try BcpInfo.init(.float16, "SQLFLT4"),
+                'f' => try BcpInfo.init(.float32, "SQLFLT4"),
+                'g' => try BcpInfo.init(.float64, "SQLFLT8"),
                 'z' => try BcpInfo.init(.bytes, "SQLBINARY"),
                 'u' => try BcpInfo.init(.bytes, "SQLCHAR"),
                 else => raise_args(.NotImplemented, "Format '{s}' not implemented", .{fmt}),
@@ -268,14 +279,6 @@ const Column = struct {
         return true;
     }
 
-    inline fn nullable(self: *Column) bool {
-        // no null buffer or null_count = 0 is likely not enough
-        // would need to be the same for every ArrowArray chunk
-        _ = self;
-        return true;
-        // return self.current_array.buffers[0] != null;
-    }
-
     inline fn valid_buffer(self: *Column) ?[*]bool {
         return @alignCast(@ptrCast(self.current_array.buffers[0]));
     }
@@ -289,12 +292,41 @@ const Column = struct {
     }
 };
 
-const formats = enum(i64) { l, bytes, decimal, date, datetime, timestamp, timestamp_timezone };
-const WriteError = error{ write_error, missing_buffer };
+const formats = enum(i64) {
+    boolean,
+    int8,
+    uint8,
+    int16,
+    uint16,
+    int32,
+    uint32,
+    int64,
+    uint64,
+    float16,
+    float32,
+    float64,
+    bytes,
+    decimal,
+    date,
+    datetime,
+    timestamp,
+    timestamp_timezone,
+};
 
 inline fn format_types(comptime format: formats) struct { prefix: type, arrow: type, bcp: type } {
     const types = switch (format) {
-        inline formats.l => .{ i8, i64, i64 },
+        inline formats.boolean => .{ i8, bool, u8 },
+        inline formats.int8 => .{ i8, i8, i16 },
+        inline formats.uint8 => .{ i8, u8, u8 },
+        inline formats.int16 => .{ i8, i16, i16 },
+        inline formats.uint16 => .{ i8, u16, i32 },
+        inline formats.int32 => .{ i8, i32, i32 },
+        inline formats.uint32 => .{ i8, u32, i64 },
+        inline formats.int64 => .{ i8, i64, i64 },
+        inline formats.uint64 => .{ i8, u64, Decimal },
+        inline formats.float16 => .{ i8, f16, f32 },
+        inline formats.float32 => .{ i8, f32, f32 },
+        inline formats.float64 => .{ i8, f64, f64 },
         inline formats.bytes => .{ i64, u32, u32 },
         inline formats.decimal => .{ i8, i128, Decimal },
         inline formats.date => .{ i8, i32, u24 },
@@ -310,14 +342,13 @@ inline fn format_types(comptime format: formats) struct { prefix: type, arrow: t
 }
 
 const format_sizes = blk: {
-    const size = struct { prefix: usize, arrow: usize, bcp: usize };
+    const size = struct { prefix: usize, bcp: usize };
 
     var arr = std.EnumArray(formats, size).initUndefined();
     for (std.enums.values(formats)) |fmt| {
         const types = format_types(fmt);
         arr.set(fmt, size{
             .prefix = @divExact(@bitSizeOf(types.prefix), 8),
-            .arrow = @divExact(@bitSizeOf(types.arrow), 8),
             .bcp = @divExact(@bitSizeOf(types.bcp), 8),
         });
     }
@@ -325,23 +356,29 @@ const format_sizes = blk: {
     break :blk arr;
 };
 
+inline fn bit_get(ptr: anytype, index: anytype) bool {
+    const ptr_cast: [*]u8 = @alignCast(@ptrCast(ptr));
+    const selector: u3 = @intCast(index % 8);
+    return 0 == (ptr_cast[@divFloor(index, 8)] & (@as(u8, 1) << selector));
+}
+
+const WriteError = error{ write_error, missing_buffer };
 inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) WriteError!void {
     const types = format_types(format);
-    var is_null: bool = false;
+    const types_size = comptime format_sizes.get(format);
     const main_buffer = try self.main_buffer(types.arrow);
     const bytes_bcp: usize = switch (format) {
         inline .bytes => main_buffer[self.next_index + 1] - main_buffer[self.next_index],
-        inline else => @bitSizeOf(types.bcp) / 8,
+        inline else => types_size.bcp,
     };
 
-    if (self.nullable() or format == .bytes or format == .decimal) {
-        if (self.valid_buffer()) |valid_buffer| {
-            is_null = !valid_buffer[self.next_index];
-        }
-        const val_null: types.prefix = if (is_null) -1 else @intCast(bytes_bcp);
-        const asbytes: [*]u8 = @constCast(@ptrCast(&val_null));
-        _ = file.write(asbytes[0..@sizeOf(types.prefix)]) catch return WriteError.write_error;
-    }
+    const is_null = if (self.valid_buffer()) |buf| bit_get(buf, self.next_index) else false;
+
+    _ = file.write(blk: {
+        const val: types.prefix = if (is_null) -1 else @intCast(bytes_bcp);
+        const bytes: [*]u8 = @constCast(@ptrCast(&val));
+        break :blk bytes[0..types_size.prefix];
+    }) catch return WriteError.write_error;
 
     if (is_null) {
         return;
@@ -349,30 +386,43 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) Wri
 
     if (format == .bytes) {
         const data_buffer = try self.data_buffer();
-        print("writing string >{s}<\n", .{data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]});
         _ = file.write(data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]) catch return WriteError.write_error;
     } else {
-        const val_arrow = main_buffer[self.next_index];
+        const val_arrow = if (format == .boolean)
+            bit_get(main_buffer, self.next_index)
+        else
+            main_buffer[self.next_index];
         const val_bcp = switch (format) {
-            .decimal => Decimal{
+            inline .decimal => Decimal{
                 .size = self.bcp_info.decimal_size,
                 .precision = self.bcp_info.decimal_precision,
                 .sign = if (val_arrow >= 0) 1 else 0,
                 .int_data = if (val_arrow >= 0) val_arrow else -val_arrow,
             },
             // TODO raise PyError when it fails
-            .date => br: {
+            inline .date => br: {
                 const x: types.bcp = @intCast(val_arrow + 719162);
                 break :br x;
             },
-            .datetime => DateTime64.from_ns_factor(val_arrow, 1000 * 1000),
-            .timestamp => DateTime64.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns),
-            .timestamp_timezone => DateTimeOffset.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns, self.bcp_info.timestamp_timezone_offset),
-            else => val_arrow,
+            inline .datetime => DateTime64.from_ns_factor(val_arrow, 1000 * 1000),
+            inline .timestamp => DateTime64.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns),
+            inline .timestamp_timezone => DateTimeOffset.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns, self.bcp_info.timestamp_timezone_offset),
+            inline .boolean => blk: {
+                const val: types.bcp = @intFromBool(val_arrow);
+                break :blk val;
+            },
+            inline .uint64 => Decimal{
+                .size = 20,
+                .precision = 0,
+                .sign = 1,
+                .int_data = @intCast(val_arrow),
+            },
+            inline else => @as(types.bcp, val_arrow),
         };
-        print("writing value >{}< at index {} with {} bytes\n", .{ val_bcp, self.next_index, bytes_bcp });
-        const asbytes: [*]u8 = @constCast(@ptrCast(&val_bcp));
-        _ = file.write(asbytes[0..bytes_bcp]) catch return WriteError.write_error;
+        _ = file.write(blk: {
+            const bytes: [*]u8 = @constCast(@ptrCast(&val_bcp));
+            break :blk bytes[0..bytes_bcp];
+        }) catch return WriteError.write_error;
     }
 }
 
