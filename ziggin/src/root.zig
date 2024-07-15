@@ -441,15 +441,30 @@ const writers = blk: {
     break :blk arr;
 };
 
-fn write_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
-    _ = module;
-    return _write_arrow(args) catch |err| switch (err) {
-        Err.PyError => return null,
-        else => unreachable,
-    };
+fn zig_to_py(value: anytype) !*py.PyObject {
+    const info = @typeInfo(@TypeOf(value));
+    return switch (info) {
+        .Int => if (info.Int.signedness == .signed) py.PyLong_FromLongLong(@as(c_longlong, value)) else py.PyLong_FromUnsignedLongLong(@as(c_ulonglong, value)),
+        .ComptimeInt => if (value < 0) py.PyLong_FromLongLong(@as(c_longlong, value)) else py.PyLong_FromUnsignedLongLong(@as(c_ulonglong, value)),
+        .Pointer => py.PyUnicode_FromStringAndSize(value.ptr, @intCast(value.len)),
+        .Struct => blk: {
+            const tuple = py.PyTuple_New(value.len) orelse return Err.PyError;
+            errdefer py.Py_DECREF(tuple);
+            inline for (std.meta.fields(@TypeOf(value)), 0..) |field, i_field| {
+                const inner_value = @field(value, field.name);
+                const py_value = try zig_to_py(inner_value);
+                if (py.PyTuple_SetItem(tuple, @intCast(i_field), py_value) == -1) {
+                    py.Py_DECREF(py_value);
+                    return Err.PyError;
+                }
+            }
+            break :blk tuple;
+        },
+        else => @compileLog("unsupported py-type conversion", info),
+    } orelse return Err.PyError;
 }
 
-fn _write_arrow(args: ?*PyObject) !?*PyObject {
+fn write_arrow(args: ?*PyObject) !?*PyObject {
     const list_schema_capsules = py.PySequence_GetItem(args, 0) orelse return Err.PyError;
     defer py.Py_DECREF(list_schema_capsules);
     const list_array_capsule_generators = py.PySequence_GetItem(args, 1) orelse return Err.PyError;
@@ -517,52 +532,31 @@ fn _write_arrow(args: ?*PyObject) !?*PyObject {
     errdefer py.Py_DECREF(format_list);
     for (columns_slice) |*col| {
         const sizes = format_sizes.get(col.bcp_info.format);
-        const format_tuple = py.PyTuple_New(3);
-        errdefer py.Py_DECREF(format_tuple);
-
-        const str_ptr: [*c]u8 = col.bcp_info.dtype_name.ptr;
-        const str_len: py.Py_ssize_t = @intCast(col.bcp_info.dtype_name.len);
-        if (py.PyTuple_SetItem(format_tuple, 0, py.PyUnicode_FromStringAndSize(str_ptr, str_len) orelse return Err.PyError) == -1) {
-            return Err.PyError;
-        }
-        if (py.PyTuple_SetItem(format_tuple, 1, py.PyLong_FromUnsignedLongLong(@as(c_ulonglong, sizes.prefix)) orelse return Err.PyError) == -1) {
-            return Err.PyError;
-        }
-        if (py.PyTuple_SetItem(format_tuple, 2, py.PyLong_FromUnsignedLongLong(@as(c_ulonglong, sizes.bcp)) orelse return Err.PyError) == -1) {
-            return Err.PyError;
-        }
-
-        if (py.PyList_Append(format_list, format_tuple) == -1) {
+        const item = try zig_to_py(.{
+            col.bcp_info.dtype_name,
+            sizes.prefix,
+            sizes.bcp,
+        });
+        defer py.Py_DECREF(item);
+        if (py.PyList_Append(format_list, item) == -1) {
             return Err.PyError;
         }
     }
     return format_list;
 }
 
-// fn zaml_load(self: [*c]PyObject, args: [*c]PyObject) callconv(.C) [*c]PyObject {
-fn zaml_load(self: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
-    _ = self;
-    // _ = args;
-    // const capsule_schema: *PyObject = undefined;
-    // py.PyArg_ParseTuple(args, "O", &capsule_schema);
-    const capsule_schema = py.PyTuple_GetItem(args, 0) orelse return null;
-    const schema_ptr = py.PyCapsule_GetPointer(capsule_schema, "arrow_schema") orelse return null;
-    const schema: *ArrowSchema = @alignCast(@ptrCast(schema_ptr));
-    print("format {s}\n", .{schema.format});
-    return py.Py_NewRef(capsule_schema);
-    // return Py_BuildValue("i", @as(c_int, 1));
+fn ext_write_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
+    _ = module;
+    return write_arrow(args) catch |err| switch (err) {
+        Err.PyError => return null,
+        else => unreachable,
+    };
 }
 
 var ZamlMethods = [_]PyMethodDef{
     PyMethodDef{
-        .ml_name = "load",
-        .ml_meth = zaml_load,
-        .ml_flags = py.METH_VARARGS,
-        .ml_doc = "Load some tasty YAML.",
-    },
-    PyMethodDef{
         .ml_name = "write_arrow",
-        .ml_meth = write_arrow,
+        .ml_meth = ext_write_arrow,
         .ml_flags = py.METH_VARARGS,
         .ml_doc = "Write arrow capsules to disk.",
     },
