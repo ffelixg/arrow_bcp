@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const print = std.debug.print;
 const py = @cImport({
-    @cDefine("Py_LIMITED_API", "3");
+    @cDefine("Py_LIMITED_API", "0x030a00f0");
     @cDefine("PY_SSIZE_T_CLEAN", {});
     @cInclude("Python.h");
 });
@@ -92,7 +92,7 @@ const ArrowArray = packed struct {
 
 const ArrowError = error{MissingBuffer};
 const Err = error{PyError};
-const Exceptions = enum { Exception, NotImplemented, TypeError };
+const Exceptions = enum { Exception, NotImplemented, TypeError, ValueError };
 
 fn raise_args(exc: Exceptions, comptime msg: []const u8, args: anytype) Err {
     @setCold(true);
@@ -100,6 +100,7 @@ fn raise_args(exc: Exceptions, comptime msg: []const u8, args: anytype) Err {
         .Exception => py.PyExc_Exception,
         .NotImplemented => py.PyExc_NotImplementedError,
         .TypeError => py.PyExc_TypeError,
+        .ValueError => py.PyExc_ValueError,
     };
     const formatted = std.fmt.allocPrintZ(allocator, msg, args) catch "Error formatting error message";
     defer allocator.free(formatted);
@@ -362,7 +363,7 @@ inline fn bit_get(ptr: anytype, index: anytype) bool {
     return 0 == (ptr_cast[@divFloor(index, 8)] & (@as(u8, 1) << selector));
 }
 
-const WriteError = error{ write_error, missing_buffer };
+const WriteError = error{ write_error, missing_buffer, int_cast };
 inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) WriteError!void {
     const types = format_types(format);
     const types_size = comptime format_sizes.get(format);
@@ -401,7 +402,7 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) Wri
             },
             // TODO raise PyError when it fails
             inline .date => br: {
-                const x: types.bcp = @intCast(val_arrow + 719162);
+                const x = std.math.cast(types.bcp, val_arrow + 719162) orelse return WriteError.int_cast;
                 break :br x;
             },
             inline .datetime => DateTime64.from_ns_factor(val_arrow, 1000 * 1000),
@@ -415,7 +416,7 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) Wri
                 .size = 20,
                 .precision = 0,
                 .sign = 1,
-                .int_data = @intCast(val_arrow),
+                .int_data = val_arrow,
             },
             inline else => @as(types.bcp, val_arrow),
         };
@@ -440,6 +441,64 @@ const writers = blk: {
     }
     break :blk arr;
 };
+
+/// Parse Python value into Zig type. Memory management for strings is handled by Python.
+/// This also means that once the original Python string is garbage collected the pointer is dangling.
+fn py_to_zig(zig_type: type, py_value: *py.PyObject) !zig_type {
+    switch (@typeInfo(zig_type)) {
+        .Int => |info| {
+            const val = if (info.signedness == .signed) py.PyLong_AsLongLong(py_value) else py.PyLong_AsUnsignedLongLong(py_value);
+            if (py.PyErr_Occurred() != null) {
+                return Err.PyError;
+            }
+            return std.math.cast(zig_type, val) orelse return raise(.ValueError, "Expected smaller integer");
+        },
+        .Pointer => |info| {
+            if (info.child == u8) {
+                var size: py.Py_ssize_t = -1;
+                const char_ptr = py.PyUnicode_AsUTF8AndSize(py_value, &size) orelse return Err.PyError;
+                // _ = char_ptr;
+                if (size < 0) {
+                    return Err.PyError;
+                }
+                return char_ptr[0..@intCast(size)];
+            }
+            if (info.child == py.PyObject) {
+                return py.Py_NewRef(py_value);
+            }
+        },
+        .Struct => |info| {
+            _ = info;
+            var zig_value: zig_type = undefined;
+            const py_value_iter = py.PyObject_GetIter(py_value) orelse return Err.PyError;
+            defer py.Py_DECREF(py_value_iter);
+            inline for (std.meta.fields(zig_type), 0..) |field, i_field| {
+                _ = i_field;
+                const py_value_inner = py.PyIter_Next(py_value_iter) orelse {
+                    if (py.PyErr_Occurred() != null) {
+                        return Err.PyError;
+                    }
+                    return raise(.TypeError, "Expected more values");
+                };
+                defer py.Py_DECREF(py_value_inner);
+                @field(zig_value, field.name) = try py_to_zig(
+                    @TypeOf(@field(zig_value, field.name)),
+                    py_value_inner,
+                );
+            }
+            const should_not_be_a_value = py.PyIter_Next(py_value_iter) orelse {
+                if (py.PyErr_Occurred() != null) {
+                    return Err.PyError;
+                }
+                return zig_value;
+            };
+            py.Py_DECREF(should_not_be_a_value);
+            return raise(.TypeError, "Expected less values");
+        },
+        else => @compileLog("unsupported conversion from py to zig", @typeInfo(zig_type)),
+    }
+    @compileLog("unsupported conversion from py to zig", @typeInfo(zig_type));
+}
 
 fn zig_to_py(value: anytype) !*py.PyObject {
     const info = @typeInfo(@TypeOf(value));
@@ -469,11 +528,11 @@ fn write_arrow(args: ?*PyObject) !?*PyObject {
     defer py.Py_DECREF(list_schema_capsules);
     const list_array_capsule_generators = py.PySequence_GetItem(args, 1) orelse return Err.PyError;
     defer py.Py_DECREF(list_array_capsule_generators);
-    const nr_columns = py.PyObject_Length(list_schema_capsules);
-    if (nr_columns == -1) {
-        return null;
-    }
-    var columns = allocator.alloc(Column, @intCast(nr_columns)) catch {
+    const nr_columns: usize = blk: {
+        const len = py.PyObject_Length(list_schema_capsules);
+        break :blk if (len == -1) return Err.PyError else @intCast(len);
+    };
+    var columns = allocator.alloc(Column, nr_columns) catch {
         _ = py.PyErr_NoMemory();
         return Err.PyError;
     };
@@ -482,7 +541,7 @@ fn write_arrow(args: ?*PyObject) !?*PyObject {
     defer for (columns[0..n_allocated_columns]) |col| {
         col.deinit();
     };
-    const columns_slice = columns[0..@intCast(nr_columns)];
+    const columns_slice = columns[0..nr_columns];
     for (columns_slice, 0..) |*col, i_col| {
         const capsule_schema = py.PySequence_GetItem(list_schema_capsules, @intCast(i_col)) orelse return Err.PyError;
         defer py.Py_DECREF(capsule_schema);
@@ -553,7 +612,114 @@ fn ext_write_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject
     };
 }
 
+const sql_types = enum(u8) {
+    bit,
+    tiny,
+    smallint,
+    int,
+    bigint,
+    float,
+    real,
+    decimal,
+    date,
+    datetime2,
+    datetimeoffset,
+    uniqueidentifier,
+    char,
+    binary,
+};
+
+const ReaderColumn = struct {
+    size_prefix: u32,
+    size_data: u32,
+    sql_type: sql_types,
+    buffer_prefix: []u8,
+    buffer_data: []u8,
+    fn deinit(self: ReaderColumn) void {
+        _ = self;
+    }
+};
+
+fn read_arrow(args: ?*PyObject) !*PyObject {
+    const py_bcp_columns = py.PySequence_GetItem(args, 0) orelse return Err.PyError;
+    defer py.Py_DECREF(py_bcp_columns);
+    const nr_columns: usize = blk: {
+        const len = py.PyObject_Length(py_bcp_columns);
+        break :blk if (len == -1) return Err.PyError else @intCast(len);
+    };
+
+    var columns = allocator.alloc(ReaderColumn, nr_columns) catch {
+        _ = py.PyErr_NoMemory();
+        return Err.PyError;
+    };
+    defer allocator.free(columns);
+    var n_allocated_columns: usize = 0;
+    defer for (columns[0..n_allocated_columns]) |col| {
+        col.deinit();
+    };
+    const columns_slice = columns[0..nr_columns];
+
+    var sql_read_buffer: [19]u8 = undefined;
+
+    for (columns[0..nr_columns], 0..) |*col, i_col| {
+        const py_bcp_column = py.PySequence_GetItem(py_bcp_columns, @intCast(i_col)) orelse return Err.PyError;
+        defer py.Py_DECREF(py_bcp_column);
+
+        const unpacked = try py_to_zig(
+            struct { sql_type: *py.PyObject, size_prefix: u32, size_data: u32 },
+            py_bcp_column,
+        );
+        defer py.Py_DECREF(unpacked.sql_type);
+
+        const py_sql_type_int = py.PyDict_GetItem(sql_type_mapping, unpacked.sql_type) orelse return Err.PyError;
+
+        col.* = ReaderColumn{
+            .size_data = unpacked.size_data,
+            .size_prefix = unpacked.size_prefix,
+            .sql_type = @enumFromInt(try py_to_zig(c_ulonglong, py_sql_type_int)),
+            .buffer_prefix = sql_read_buffer[0..unpacked.size_prefix],
+            .buffer_data = sql_read_buffer[0..unpacked.size_data],
+        };
+        n_allocated_columns += 1;
+        print("col {any}\n", .{col.*});
+    }
+    var file = std.fs.openFileAbsoluteZ("/tmp/arrowwrite.dat", .{}) catch {
+        return raise(.Exception, "Error opening file");
+    };
+    defer file.close();
+
+    // main_loop: while (true) {
+    for (columns_slice, 0..) |*col, i_col| {
+        _ = i_col;
+        try read_cell(col, file);
+    }
+    // }
+
+    return py.Py_NewRef(py.Py_None());
+}
+
+fn read_cell(col: *ReaderColumn, file: std.fs.File) !void {
+    const prefix_read = try file.read(col.buffer_prefix);
+    print("col.buffer_prefix: {}, bytes: {any}\n", .{ prefix_read, col.buffer_prefix });
+    const data_read = try file.read(col.buffer_data);
+    print("col.buffer_data: {}, bytes: {any}\n", .{ data_read, col.buffer_data });
+}
+
+fn ext_read_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
+    _ = module;
+    return read_arrow(args) catch |err| switch (err) {
+        Err.PyError => return null,
+        else => unreachable,
+    };
+}
+
 var ZamlMethods = [_]PyMethodDef{
+    PyMethodDef{
+        .ml_name = "read_arrow",
+        .ml_meth = ext_read_arrow,
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "Read from disk to arrow capsules.",
+    },
     PyMethodDef{
         .ml_name = "write_arrow",
         .ml_meth = ext_write_arrow,
@@ -589,6 +755,29 @@ var zamlmodule = PyModuleDef{
     .m_free = null,
 };
 
-pub export fn PyInit_zaml() [*]PyObject {
+var sql_type_mapping: *py.PyObject = undefined;
+
+fn sql_type_mapping_set_val(key: anytype, val: sql_types) bool {
+    const py_val = py.PyLong_FromLongLong(@intCast(@intFromEnum(val))) orelse return true;
+    if (py.PyDict_SetItemString(sql_type_mapping, key, py_val) == -1) return true;
+    return false;
+}
+
+pub export fn PyInit_zaml() ?*PyObject {
+    sql_type_mapping = py.PyDict_New() orelse return null;
+    if (sql_type_mapping_set_val("SQLBIT", .bit)) return null;
+    if (sql_type_mapping_set_val("SQLTINYINT", .tiny)) return null;
+    if (sql_type_mapping_set_val("SQLSMALLINT", .smallint)) return null;
+    if (sql_type_mapping_set_val("SQLINT", .int)) return null;
+    if (sql_type_mapping_set_val("SQLBIGINT", .bigint)) return null;
+    if (sql_type_mapping_set_val("SQLFLT4", .float)) return null;
+    if (sql_type_mapping_set_val("SQLFLT8", .real)) return null;
+    if (sql_type_mapping_set_val("SQLDECIMAL", .decimal)) return null;
+    if (sql_type_mapping_set_val("SQLDATE", .date)) return null;
+    if (sql_type_mapping_set_val("SQLDATETIME2", .datetime2)) return null;
+    if (sql_type_mapping_set_val("SQLDATETIMEOFFSET", .datetimeoffset)) return null;
+    if (sql_type_mapping_set_val("SQLUNIQUEID", .uniqueidentifier)) return null;
+    if (sql_type_mapping_set_val("SQLCHAR", .char)) return null;
+    if (sql_type_mapping_set_val("SQLBINARY", .binary)) return null;
     return PyModule_Create(&zamlmodule);
 }
