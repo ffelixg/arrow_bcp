@@ -57,37 +57,125 @@ const DateTimeOffset = packed struct {
     }
 };
 
-const ArrowSchema = packed struct {
+fn dummy_release_schema(self: *ArrowSchema) void {
+    // _ = self;
+    // unreachable; // handled by capsule
+    // self.private_data.deinit();
+    self.release = null;
+}
+
+const ArrowSchema = extern struct {
     // Array type description
     format: [*:0]const u8,
-    name: [*:0]const u8,
-    metadata: [*]const u8,
-    flags: i64,
-    n_children: i64,
-    children: [*][*]ArrowSchema,
-    dictionary: [*]ArrowSchema,
+    name: ?[*:0]const u8 = null,
+    metadata: ?[*]const u8 = null,
+    flags: i64 = 0,
+    n_children: i64 = 0,
+    children: ?[*][*]ArrowSchema = null,
+    dictionary: ?[*]ArrowSchema = null,
 
     // Release callback
-    release: ?*fn (*ArrowSchema) void,
+    release: ?*fn (*ArrowSchema) void = @constCast(&dummy_release_schema),
     // Opaque producer-specific data
-    private_data: ?*anyopaque,
+    private_data: *SchemaProducer,
 };
 
-const ArrowArray = packed struct {
+const SchemaProducer = struct {
+    schema: *ArrowSchema,
+    decimal: ?struct { size: u8, precision: u8 } = null,
+    offset: ?i16 = null,
+    arena: std.heap.ArenaAllocator,
+    sql: struct {
+        format: formats_sql,
+        size_prefix: u32,
+        size_data: u32,
+    },
+
+    fn deinit(self: SchemaProducer) void {
+        self.arena.deinit();
+    }
+
+    fn validate_decimal(self: *SchemaProducer, size: u8, precision: u8) !void {
+        if (self.decimal) |dec| {
+            if (size != dec.size or precision != dec.precision) {
+                return ReadError.DecimalChanged;
+            }
+        } else {
+            self.decimal = .{ .size = size, .precision = precision };
+            self.schema.format = try std.fmt.allocPrintZ(
+                self.arena.allocator(),
+                "d:{}:{}",
+                .{ precision, size },
+            );
+        }
+    }
+
+    fn validate_timezone(self: *SchemaProducer, offset: i16) !void {
+        if (self.offset) |off| {
+            if (off != offset) {
+                return ReadError.TimezoneChanged;
+            }
+        } else {
+            self.offset = offset;
+            const sign: u8 = if (offset >= 0) '+' else blk: {
+                offset = -offset;
+                break :blk '-';
+            };
+            const hours: i16 = @divFloor(offset, 60);
+            const minutes: i16 = @mod(offset, 60);
+            self.schema.format = try std.fmt.allocPrintZ(
+                self.arena.allocator(),
+                "tsn:{c}{}{}",
+                .{ sign, hours, minutes },
+            );
+        }
+    }
+
+    fn from_capsule(capsule: *PyObject) ?*SchemaProducer {
+        const ptr = py.PyCapsule_GetPointer(capsule, "arrow_schema") orelse return null;
+        const schema: *ArrowSchema = @alignCast(@ptrCast(ptr));
+        return schema.private_data;
+    }
+
+    fn release_capsule(capsule: ?*PyObject) callconv(.C) void {
+        if (capsule) |c| {
+            if (from_capsule(c)) |schema| {
+                schema.deinit();
+            }
+            unreachable;
+        }
+        unreachable;
+    }
+
+    fn to_capsule(self: *SchemaProducer) !*PyObject {
+        return py.PyCapsule_New(
+            @ptrCast(self.schema),
+            "arrow_schema",
+            @constCast(&SchemaProducer.release_capsule),
+        ) orelse return Err.PyError;
+    }
+};
+
+fn dummy_release_array(self: *ArrowArray) void {
+    _ = self;
+    unreachable; // handled by capsule
+}
+
+const ArrowArray = extern struct {
     // Array data description
     length: i64,
     null_count: i64,
-    offset: i64,
+    offset: i64 = 0,
     n_buffers: i64,
-    n_children: i64,
+    n_children: i64 = 0,
     buffers: [*]?*anyopaque,
-    children: [*][*]ArrowArray,
-    dictionary: [*]ArrowArray,
+    children: ?[*][*]ArrowArray = null,
+    dictionary: ?[*]ArrowArray = null,
 
     // Release callback
-    release: ?*fn (*ArrowArray) void,
+    release: ?*fn (*ArrowArray) void = @constCast(&dummy_release_array),
     // Opaque producer-specific data
-    private_data: ?*anyopaque,
+    producer: *ArrayProducer,
 };
 
 const ArrowError = error{MissingBuffer};
@@ -612,7 +700,7 @@ fn ext_write_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject
     };
 }
 
-const sql_types = enum(u8) {
+const formats_sql = enum(u8) {
     bit,
     tiny,
     smallint,
@@ -629,40 +717,59 @@ const sql_types = enum(u8) {
     binary,
 };
 
-const ReaderColumn = struct {
-    size_prefix: u32,
-    size_data: u32,
-    sql_type: sql_types,
+const formatinfo_sql = blk: {
+    var format_strings = std.EnumArray(formats_sql, []const u8).initUndefined();
+    for (std.enums.values(formats_sql)) |fmt| {
+        const info = switch (fmt) {
+            formats_sql.bit => .{ u8, u1, "b" },
+            formats_sql.tiny => .{ u8, u8, "C" },
+            formats_sql.smallint => .{ i16, i16, "s" },
+            formats_sql.int => .{ i32, i32, "i" },
+            formats_sql.bigint => .{ i64, i64, "l" },
+            formats_sql.float => .{ f32, f32, "f" },
+            formats_sql.real => .{ f64, f64, "g" },
+            formats_sql.decimal => .{ Decimal, i128, "n" }, // scale/precision unknown until first row is read
+            formats_sql.date => .{ u24, i32, "tdD" },
+            formats_sql.datetime2 => .{ DateTime64, i64, "tsn:" },
+            formats_sql.datetimeoffset => .{ DateTimeOffset, i64, "n" }, // timezone unknown until first row is read
+            formats_sql.uniqueidentifier => .{ [16]u8, [16]u8, "w:16" },
+            formats_sql.char => .{ noreturn, u32, "u" },
+            formats_sql.binary => .{ noreturn, u32, "z" },
+        };
+        format_strings.set(fmt, info[2] ++ "\x00");
+    }
+    const T = struct { format_strings: @TypeOf(format_strings) };
+    break :blk T{ .format_strings = format_strings };
+};
+
+const ArrayProducer = struct {
+    array: *ArrowArray,
     buffer_prefix: []u8,
     buffer_data: []u8,
-    fn deinit(self: ReaderColumn) void {
+    arena: std.heap.ArenaAllocator,
+    has_data_buffer: bool,
+    fn deinit(self: ArrayProducer) void {
         _ = self;
     }
 };
 
-fn read_arrow(args: ?*PyObject) !*PyObject {
-    const py_bcp_columns = py.PySequence_GetItem(args, 0) orelse return Err.PyError;
-    defer py.Py_DECREF(py_bcp_columns);
+fn init_reader(py_args: ?*PyObject) !*PyObject {
+    const args = try py_to_zig(
+        struct { bcp_columns: *PyObject },
+        py_args orelse return raise(.Exception, "No arguments passed"),
+    );
+    defer py.Py_DECREF(args.bcp_columns);
+
     const nr_columns: usize = blk: {
-        const len = py.PyObject_Length(py_bcp_columns);
+        const len = py.PyObject_Length(args.bcp_columns);
         break :blk if (len == -1) return Err.PyError else @intCast(len);
     };
 
-    var columns = allocator.alloc(ReaderColumn, nr_columns) catch {
-        _ = py.PyErr_NoMemory();
-        return Err.PyError;
-    };
-    defer allocator.free(columns);
-    var n_allocated_columns: usize = 0;
-    defer for (columns[0..n_allocated_columns]) |col| {
-        col.deinit();
-    };
-    const columns_slice = columns[0..nr_columns];
+    const ret = py.PyTuple_New(@intCast(nr_columns)) orelse return Err.PyError;
+    errdefer py.Py_DECREF(ret);
 
-    var sql_read_buffer: [19]u8 = undefined;
-
-    for (columns[0..nr_columns], 0..) |*col, i_col| {
-        const py_bcp_column = py.PySequence_GetItem(py_bcp_columns, @intCast(i_col)) orelse return Err.PyError;
+    for (0..nr_columns) |i_col| {
+        const py_bcp_column = py.PySequence_GetItem(args.bcp_columns, @intCast(i_col)) orelse return Err.PyError;
         defer py.Py_DECREF(py_bcp_column);
 
         const unpacked = try py_to_zig(
@@ -672,14 +779,111 @@ fn read_arrow(args: ?*PyObject) !*PyObject {
         defer py.Py_DECREF(unpacked.sql_type);
 
         const py_sql_type_int = py.PyDict_GetItem(sql_type_mapping, unpacked.sql_type) orelse return Err.PyError;
+        defer py.Py_DECREF(py_sql_type_int);
+        const format_sql: formats_sql = @enumFromInt(try py_to_zig(c_ulonglong, py_sql_type_int));
 
-        col.* = ReaderColumn{
-            .size_data = unpacked.size_data,
-            .size_prefix = unpacked.size_prefix,
-            .sql_type = @enumFromInt(try py_to_zig(c_ulonglong, py_sql_type_int)),
-            .buffer_prefix = sql_read_buffer[0..unpacked.size_prefix],
-            .buffer_data = sql_read_buffer[0..unpacked.size_data],
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        var arena_alloc = arena.allocator();
+
+        const schema = try arena_alloc.create(ArrowSchema);
+        schema.* = .{
+            .format = @ptrCast(formatinfo_sql.format_strings.get(format_sql).ptr),
+            .private_data = undefined,
         };
+
+        const producer_data = try arena_alloc.create(SchemaProducer);
+        producer_data.* = .{
+            .schema = schema,
+            .sql = .{
+                .format = format_sql,
+                .size_data = unpacked.size_data,
+                .size_prefix = unpacked.size_prefix,
+            },
+            .arena = arena,
+        };
+
+        schema.private_data = producer_data;
+
+        print("col {any}\n", .{producer_data.*});
+
+        const capsule = try producer_data.to_capsule();
+        errdefer py.Py_DECREF(capsule);
+        if (py.PyTuple_SetItem(ret, @intCast(i_col), capsule) == -1) {
+            return Err.PyError;
+        }
+    }
+
+    return ret;
+}
+
+fn read_batch(py_args: ?*PyObject) !*PyObject {
+    const args = try py_to_zig(
+        struct { schema_capsules: *PyObject, rows_max: u32 },
+        py_args orelse return raise(.Exception, "No arguments passed"),
+    );
+    defer py.Py_DECREF(args.schema_capsules);
+
+    const nr_columns: usize = blk: {
+        const len = py.PyObject_Length(args.schema_capsules);
+        break :blk if (len == -1) return Err.PyError else @intCast(len);
+    };
+
+    const schemas = allocator.alloc(*SchemaProducer, nr_columns) catch {
+        _ = py.PyErr_NoMemory();
+        return Err.PyError;
+    };
+    defer allocator.free(schemas);
+
+    for (schemas, 0..) |*schema, i_schema| {
+        const capsule = py.PySequence_GetItem(args.schema_capsules, @intCast(i_schema)) orelse return Err.PyError;
+        defer py.Py_DECREF(capsule);
+        schema.* = SchemaProducer.from_capsule(capsule) orelse return raise(.Exception, "Could not read schema capsule");
+    }
+
+    var arrays = allocator.alloc(*ArrayProducer, nr_columns) catch {
+        _ = py.PyErr_NoMemory();
+        return Err.PyError;
+    };
+    defer allocator.free(arrays);
+    var n_allocated_columns: usize = 0;
+    errdefer for (arrays[0..n_allocated_columns]) |array| {
+        array.deinit();
+    };
+
+    var sql_read_buffer: [19]u8 = undefined;
+
+    for (arrays[0..nr_columns], schemas) |*col, schema| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        var arena_alloc = arena.allocator();
+
+        const producer_data = try arena_alloc.create(ArrayProducer);
+        producer_data.* = .{
+            .array = undefined,
+            .buffer_prefix = sql_read_buffer[0..schema.sql.size_prefix],
+            .buffer_data = sql_read_buffer[0..schema.sql.size_data],
+            .arena = arena,
+            .has_data_buffer = switch (schema.sql.format) {
+                formats_sql.binary, formats_sql.char => true,
+                else => false,
+            },
+        };
+
+        const buffers = try arena_alloc.alloc(*anyopaque, if (producer_data.has_data_buffer) 3 else 2);
+
+        const array = try arena_alloc.create(ArrowArray);
+        array.* = .{
+            .buffers = @alignCast(@ptrCast(buffers.ptr)),
+            .length = args.rows_max,
+            .n_buffers = @intCast(buffers.len),
+            .null_count = 0,
+            .producer = producer_data,
+        };
+        producer_data.array = array;
+
+        // pass ownership, do not run into errdefer afterwards
+        col.* = producer_data;
         n_allocated_columns += 1;
         print("col {any}\n", .{col.*});
     }
@@ -689,7 +893,7 @@ fn read_arrow(args: ?*PyObject) !*PyObject {
     defer file.close();
 
     // main_loop: while (true) {
-    for (columns_slice, 0..) |*col, i_col| {
+    for (arrays, 0..) |col, i_col| {
         _ = i_col;
         try read_cell(col, file);
     }
@@ -698,16 +902,28 @@ fn read_arrow(args: ?*PyObject) !*PyObject {
     return py.Py_NewRef(py.Py_None());
 }
 
-fn read_cell(col: *ReaderColumn, file: std.fs.File) !void {
+const ReadError = error{ DecimalChanged, TimezoneChanged };
+
+// fn read_cell(arr: *ArrowArray, file: std.fs.File) !void {
+fn read_cell(col: *ArrayProducer, file: std.fs.File) !void {
+    // const col: *ReaderColumn = @alignCast(@ptrCast(arr.producer));
     const prefix_read = try file.read(col.buffer_prefix);
     print("col.buffer_prefix: {}, bytes: {any}\n", .{ prefix_read, col.buffer_prefix });
     const data_read = try file.read(col.buffer_data);
     print("col.buffer_data: {}, bytes: {any}\n", .{ data_read, col.buffer_data });
 }
 
-fn ext_read_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
+fn ext_init_reader(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
     _ = module;
-    return read_arrow(args) catch |err| switch (err) {
+    return init_reader(args) catch |err| switch (err) {
+        Err.PyError => return null,
+        else => unreachable,
+    };
+}
+
+fn ext_read_batch(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
+    _ = module;
+    return read_batch(args) catch |err| switch (err) {
         Err.PyError => return null,
         else => unreachable,
     };
@@ -715,8 +931,14 @@ fn ext_read_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject 
 
 var ZamlMethods = [_]PyMethodDef{
     PyMethodDef{
+        .ml_name = "init_reader",
+        .ml_meth = ext_init_reader,
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "Prepare reader.",
+    },
+    PyMethodDef{
         .ml_name = "read_arrow",
-        .ml_meth = ext_read_arrow,
+        .ml_meth = ext_read_batch,
         .ml_flags = py.METH_VARARGS,
         .ml_doc = "Read from disk to arrow capsules.",
     },
@@ -757,7 +979,7 @@ var zamlmodule = PyModuleDef{
 
 var sql_type_mapping: *py.PyObject = undefined;
 
-fn sql_type_mapping_set_val(key: anytype, val: sql_types) bool {
+fn sql_type_mapping_set_val(key: anytype, val: formats_sql) bool {
     const py_val = py.PyLong_FromLongLong(@intCast(@intFromEnum(val))) orelse return true;
     if (py.PyDict_SetItemString(sql_type_mapping, key, py_val) == -1) return true;
     return false;
