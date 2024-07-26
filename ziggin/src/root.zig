@@ -794,26 +794,28 @@ const formats_sql = enum(u8) {
 const type_read_cell = *fn (usize, *ReaderState, *ArrowArray) ReadError!void;
 
 const format_info_sql = blk: {
+    var kvs_bcp_format: [std.enums.values(formats_sql).len]struct { []const u8, formats_sql } = undefined;
     var format_strings = std.EnumArray(formats_sql, []const u8).initUndefined();
     var readers = std.EnumArray(formats_sql, type_read_cell).initUndefined();
     var types = std.EnumArray(formats_sql, struct { prefix: type, bcp: type, arrow: type }).initUndefined();
     var bit_sizes = std.EnumArray(formats_sql, struct { prefix: u15, bcp: u15, arrow: u15 }).initUndefined();
-    for (std.enums.values(formats_sql)) |fmt| {
+    for (std.enums.values(formats_sql), 0..) |fmt, i_fmt| {
         const info = switch (fmt) {
-            formats_sql.bit => .{ i8, u8, u1, "b" },
-            formats_sql.tiny => .{ i8, u8, u8, "C" },
-            formats_sql.smallint => .{ i8, i16, i16, "s" },
-            formats_sql.int => .{ i8, i32, i32, "i" },
-            formats_sql.bigint => .{ i8, i64, i64, "l" },
-            formats_sql.float => .{ i8, f32, f32, "f" },
-            formats_sql.real => .{ i8, f64, f64, "g" },
-            formats_sql.decimal => .{ i8, Decimal, i128, "n" }, // scale/precision unknown until first row is read
-            formats_sql.date => .{ i8, u24, i32, "tdD" },
-            formats_sql.datetime2 => .{ i8, DateTime64, i64, "tsn:" },
-            formats_sql.datetimeoffset => .{ i8, DateTimeOffset, i64, "n" }, // timezone unknown until first row is read
-            formats_sql.uniqueidentifier => .{ i8, [16]u8, [16]u8, "w:16" },
-            formats_sql.char => .{ i64, u0, u32, "u" },
-            formats_sql.binary => .{ i64, u0, u32, "z" },
+            // scale/precision and timezone are unknown until first row is read => mark as null type initially
+            formats_sql.bit => .{ i8, u8, u1, "b", "SQLBIT" },
+            formats_sql.tiny => .{ i8, u8, u8, "C", "SQLTINYINT" },
+            formats_sql.smallint => .{ i8, i16, i16, "s", "SQLSMALLINT" },
+            formats_sql.int => .{ i8, i32, i32, "i", "SQLINT" },
+            formats_sql.bigint => .{ i8, i64, i64, "l", "SQLBIGINT" },
+            formats_sql.float => .{ i8, f32, f32, "f", "SQLFLT4" },
+            formats_sql.real => .{ i8, f64, f64, "g", "SQLFLT8" },
+            formats_sql.decimal => .{ i8, Decimal, i128, "n", "SQLDECIMAL" },
+            formats_sql.date => .{ i8, u24, i32, "tdD", "SQLDATE" },
+            formats_sql.datetime2 => .{ i8, DateTime64, i64, "tsn:", "SQLDATETIME2" },
+            formats_sql.datetimeoffset => .{ i8, DateTimeOffset, i64, "n", "SQLDATETIMEOFFSET" },
+            formats_sql.uniqueidentifier => .{ i8, [16]u8, [16]u8, "w:16", "SQLUNIQUEID" },
+            formats_sql.char => .{ i64, u0, u32, "u", "SQLCHAR" },
+            formats_sql.binary => .{ i64, u0, u32, "z", "SQLBINARY" },
         };
         format_strings.set(fmt, info[3] ++ "\x00");
         const dummy = struct {
@@ -832,18 +834,23 @@ const format_info_sql = blk: {
             .bcp = @bitSizeOf(info[1]),
             .arrow = @bitSizeOf(info[2]),
         });
+        kvs_bcp_format[i_fmt] = .{ info[4], fmt };
     }
+    const enum_from_bcp = std.StaticStringMap(formats_sql).initComptime(kvs_bcp_format);
+
     const T = struct {
         format_strings: @TypeOf(format_strings),
         readers: @TypeOf(readers),
         types: @TypeOf(types),
         bit_sizes: @TypeOf(bit_sizes),
+        enum_from_bcp: @TypeOf(enum_from_bcp),
     };
     break :blk T{
         .format_strings = format_strings,
         .readers = readers,
         .types = types,
         .bit_sizes = bit_sizes,
+        .enum_from_bcp = enum_from_bcp,
     };
 };
 
@@ -885,15 +892,11 @@ fn init_reader(py_args: ?*PyObject) !*PyObject {
             defer py.Py_DECREF(py_bcp_column);
 
             const unpacked = try py_to_zig(
-                struct { sql_type: *py.PyObject, size_prefix: u32, size_data: u32 },
+                struct { sql_type: []const u8, size_prefix: u32, size_data: u32 },
                 py_bcp_column,
             );
-            defer py.Py_DECREF(unpacked.sql_type);
 
-            const py_sql_type_int = py.PyDict_GetItem(sql_type_mapping, unpacked.sql_type) orelse return Err.PyError;
-            defer py.Py_DECREF(py_sql_type_int);
-            const format_sql: formats_sql = @enumFromInt(try py_to_zig(c_ulonglong, py_sql_type_int));
-
+            const format_sql = format_info_sql.enum_from_bcp.get(unpacked.sql_type) orelse return raise_args(.TypeError, "Unsupported SQL type {s}", .{unpacked.sql_type});
             const bit_sizes = format_info_sql.bit_sizes.get(format_sql);
             if (format_sql == .binary or format_sql == .char) {
                 if (unpacked.size_data != 0)
@@ -1163,29 +1166,6 @@ var zamlmodule = PyModuleDef{
     .m_free = null,
 };
 
-var sql_type_mapping: *py.PyObject = undefined;
-
-fn sql_type_mapping_set_val(key: anytype, val: formats_sql) bool {
-    const py_val = py.PyLong_FromLongLong(@intCast(@intFromEnum(val))) orelse return true;
-    if (py.PyDict_SetItemString(sql_type_mapping, key, py_val) == -1) return true;
-    return false;
-}
-
 pub export fn PyInit_zaml() ?*PyObject {
-    sql_type_mapping = py.PyDict_New() orelse return null;
-    if (sql_type_mapping_set_val("SQLBIT", .bit)) return null;
-    if (sql_type_mapping_set_val("SQLTINYINT", .tiny)) return null;
-    if (sql_type_mapping_set_val("SQLSMALLINT", .smallint)) return null;
-    if (sql_type_mapping_set_val("SQLINT", .int)) return null;
-    if (sql_type_mapping_set_val("SQLBIGINT", .bigint)) return null;
-    if (sql_type_mapping_set_val("SQLFLT4", .float)) return null;
-    if (sql_type_mapping_set_val("SQLFLT8", .real)) return null;
-    if (sql_type_mapping_set_val("SQLDECIMAL", .decimal)) return null;
-    if (sql_type_mapping_set_val("SQLDATE", .date)) return null;
-    if (sql_type_mapping_set_val("SQLDATETIME2", .datetime2)) return null;
-    if (sql_type_mapping_set_val("SQLDATETIMEOFFSET", .datetimeoffset)) return null;
-    if (sql_type_mapping_set_val("SQLUNIQUEID", .uniqueidentifier)) return null;
-    if (sql_type_mapping_set_val("SQLCHAR", .char)) return null;
-    if (sql_type_mapping_set_val("SQLBINARY", .binary)) return null;
     return PyModule_Create(&zamlmodule);
 }
