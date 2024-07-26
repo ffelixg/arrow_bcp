@@ -101,7 +101,6 @@ fn release_state(state: *StateContainer) void {
 const StateContainer = struct {
     arena: std.heap.ArenaAllocator,
     columns: []ReaderState,
-    buffer: [19]u8 = undefined,
     file: std.fs.File,
     release: ?*fn (*StateContainer) void = @constCast(&release_state),
 };
@@ -111,17 +110,34 @@ const ReaderState = struct {
     schema: *ArrowSchema,
     decimal: ?struct { size: u8, precision: u8 } = null,
     offset: ?i16 = null,
-    sql: struct {
-        format: formats_sql,
-        size_prefix: u32,
-        size_data: u32,
-    },
-    buffer: struct {
-        prefix: []u8,
-        data: []u8,
-        has_data_buffer: bool,
-    },
+    format: formats_sql,
     read_cell: type_read_cell,
+
+    inline fn has_data_buffer(self: ReaderState) bool {
+        return switch (self.format) {
+            .char, .binary => true,
+            else => false,
+        };
+    }
+
+    inline fn read(self: *ReaderState, target_ptr: anytype) !bool {
+        const info = @typeInfo(@TypeOf(target_ptr)).Pointer;
+        const target_as_bytes = switch (info.size) {
+            inline .One => std.mem.asBytes(target_ptr)[0..@divExact(@bitSizeOf(info.child), 8)],
+            inline .Slice => target_ptr,
+            inline else => comptime unreachable,
+        };
+
+        const bytes_read = self.parent.file.read(target_as_bytes) catch return ReadError.file_error;
+
+        if (bytes_read == target_as_bytes.len) {
+            return true;
+        } else if (bytes_read == 0) {
+            return false;
+        } else {
+            return ReadError.EOF_unexpected;
+        }
+    }
 
     fn validate_decimal(self: *ReaderState, size: u8, precision: u8) !void {
         if (self.decimal) |dec| {
@@ -775,39 +791,47 @@ const formats_sql = enum(u8) {
     binary,
 };
 
-const type_read_cell = *fn (usize, *ReaderState, *ArrowArray, std.fs.File) ReadError!void;
+const type_read_cell = *fn (usize, *ReaderState, *ArrowArray) ReadError!void;
 
 const format_info_sql = blk: {
     var format_strings = std.EnumArray(formats_sql, []const u8).initUndefined();
     var readers = std.EnumArray(formats_sql, type_read_cell).initUndefined();
-    var types = std.EnumArray(formats_sql, struct { bcp: type, arrow: type }).initUndefined();
-    var bit_sizes = std.EnumArray(formats_sql, struct { bcp: u15, arrow: u15 }).initUndefined();
+    var types = std.EnumArray(formats_sql, struct { prefix: type, bcp: type, arrow: type }).initUndefined();
+    var bit_sizes = std.EnumArray(formats_sql, struct { prefix: u15, bcp: u15, arrow: u15 }).initUndefined();
     for (std.enums.values(formats_sql)) |fmt| {
         const info = switch (fmt) {
-            formats_sql.bit => .{ u8, u1, "b" },
-            formats_sql.tiny => .{ u8, u8, "C" },
-            formats_sql.smallint => .{ i16, i16, "s" },
-            formats_sql.int => .{ i32, i32, "i" },
-            formats_sql.bigint => .{ i64, i64, "l" },
-            formats_sql.float => .{ f32, f32, "f" },
-            formats_sql.real => .{ f64, f64, "g" },
-            formats_sql.decimal => .{ Decimal, i128, "n" }, // scale/precision unknown until first row is read
-            formats_sql.date => .{ u24, i32, "tdD" },
-            formats_sql.datetime2 => .{ DateTime64, i64, "tsn:" },
-            formats_sql.datetimeoffset => .{ DateTimeOffset, i64, "n" }, // timezone unknown until first row is read
-            formats_sql.uniqueidentifier => .{ [16]u8, [16]u8, "w:16" },
-            formats_sql.char => .{ u0, u32, "u" },
-            formats_sql.binary => .{ u0, u32, "z" },
+            formats_sql.bit => .{ i8, u8, u1, "b" },
+            formats_sql.tiny => .{ i8, u8, u8, "C" },
+            formats_sql.smallint => .{ i8, i16, i16, "s" },
+            formats_sql.int => .{ i8, i32, i32, "i" },
+            formats_sql.bigint => .{ i8, i64, i64, "l" },
+            formats_sql.float => .{ i8, f32, f32, "f" },
+            formats_sql.real => .{ i8, f64, f64, "g" },
+            formats_sql.decimal => .{ i8, Decimal, i128, "n" }, // scale/precision unknown until first row is read
+            formats_sql.date => .{ i8, u24, i32, "tdD" },
+            formats_sql.datetime2 => .{ i8, DateTime64, i64, "tsn:" },
+            formats_sql.datetimeoffset => .{ i8, DateTimeOffset, i64, "n" }, // timezone unknown until first row is read
+            formats_sql.uniqueidentifier => .{ i8, [16]u8, [16]u8, "w:16" },
+            formats_sql.char => .{ i64, u0, u32, "u" },
+            formats_sql.binary => .{ i64, u0, u32, "z" },
         };
-        format_strings.set(fmt, info[2] ++ "\x00");
+        format_strings.set(fmt, info[3] ++ "\x00");
         const dummy = struct {
-            fn read_cell_fmt(i_row: usize, state: *ReaderState, arr: *ArrowArray, file: std.fs.File) ReadError!void {
-                return try read_cell(i_row, state, arr, file, fmt);
+            fn read_cell_fmt(i_row: usize, state: *ReaderState, arr: *ArrowArray) ReadError!void {
+                return try read_cell(i_row, state, arr, fmt);
             }
         };
         readers.set(fmt, @constCast(&dummy.read_cell_fmt));
-        types.set(fmt, .{ .bcp = info[0], .arrow = info[1] });
-        bit_sizes.set(fmt, .{ .bcp = @bitSizeOf(info[0]), .arrow = @bitSizeOf(info[1]) });
+        types.set(fmt, .{
+            .prefix = info[0],
+            .bcp = info[1],
+            .arrow = info[2],
+        });
+        bit_sizes.set(fmt, .{
+            .prefix = @bitSizeOf(info[0]),
+            .bcp = @bitSizeOf(info[1]),
+            .arrow = @bitSizeOf(info[2]),
+        });
     }
     const T = struct {
         format_strings: @TypeOf(format_strings),
@@ -870,6 +894,17 @@ fn init_reader(py_args: ?*PyObject) !*PyObject {
             defer py.Py_DECREF(py_sql_type_int);
             const format_sql: formats_sql = @enumFromInt(try py_to_zig(c_ulonglong, py_sql_type_int));
 
+            const bit_sizes = format_info_sql.bit_sizes.get(format_sql);
+            if (format_sql == .binary or format_sql == .char) {
+                if (unpacked.size_data != 0)
+                    return raise_args(.TypeError, "Expected size 0 indicating varbinary/varchar(max), got {}", .{unpacked.size_data});
+            } else {
+                if (unpacked.size_data != @divExact(bit_sizes.bcp, 8))
+                    return raise_args(.TypeError, "Unexpected data size: got {}, expected {}", .{ unpacked.size_data, @divExact(bit_sizes.bcp, 8) });
+            }
+            if (unpacked.size_prefix != @divExact(bit_sizes.prefix, 8))
+                return raise_args(.TypeError, "Unexpected prefix size: got {}, expected {}", .{ unpacked.size_prefix, @divExact(bit_sizes.prefix, 8) });
+
             const schema = try malloc.create(ArrowSchema);
             errdefer malloc.destroy(schema);
             schema.* = .{
@@ -879,19 +914,7 @@ fn init_reader(py_args: ?*PyObject) !*PyObject {
             state.* = .{
                 .parent = container,
                 .schema = schema,
-                .sql = .{
-                    .format = format_sql,
-                    .size_data = unpacked.size_data,
-                    .size_prefix = unpacked.size_prefix,
-                },
-                .buffer = .{
-                    .data = container.buffer[0..unpacked.size_data],
-                    .prefix = container.buffer[0..unpacked.size_prefix],
-                    .has_data_buffer = switch (format_sql) {
-                        .char, .binary => true,
-                        else => false,
-                    },
-                },
+                .format = format_sql,
                 .read_cell = format_info_sql.readers.get(format_sql),
             };
 
@@ -939,8 +962,8 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
     };
 
     for (arrays[0..nr_columns], state.columns) |*arr_ptr, state_col| {
-        const n_buffers: u7 = if (state_col.buffer.has_data_buffer) 3 else 2;
-        // const buffers = std.c.malloc(@sizeOf(*anyopaque) * n_buffers) orelse return malloc_error.mem;
+        const has_data_buffer = state_col.has_data_buffer();
+        const n_buffers: u7 = if (has_data_buffer) 3 else 2;
         const buffers = try malloc.alloc(*anyopaque, n_buffers);
         errdefer malloc.free(buffers);
 
@@ -949,18 +972,17 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
         @memset(valid_buffer, 0xFF);
         buffers[0] = valid_buffer.ptr;
 
-        const value_buffer = try malloc.alloc(u8, format_info_sql.bit_sizes.get(state_col.sql.format).arrow * @divExact(rows_max_rounded, 8));
+        const value_buffer = try malloc.alloc(u8, format_info_sql.bit_sizes.get(state_col.format).arrow * @divExact(rows_max_rounded, 8));
         errdefer malloc.free(value_buffer);
         buffers[1] = value_buffer.ptr;
 
-        const data_buffer: ?[]u8 = if (state_col.buffer.has_data_buffer)
+        const data_buffer: ?[]u8 = if (has_data_buffer)
             try malloc.alloc(u8, args.rows_max * 42)
         else
             null;
         errdefer if (data_buffer) |buf| malloc.free(buf);
         if (data_buffer) |buf| {
             @memset(value_buffer[0..4], 0);
-            // value_buffer[0] = 0;
             buffers[2] = buf.ptr;
         }
 
@@ -983,7 +1005,7 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
     main_loop: for (0..args.rows_max) |i_row| {
         for (arrays, state.columns, 0..) |arr, *st, i_col| {
             print("i_col {}\n", .{i_col});
-            st.read_cell(i_row, st, arr, state.file) catch |err| switch (err) {
+            st.read_cell(i_row, st, arr) catch |err| switch (err) {
                 ReadError.EOF_expected => if (i_col != 0) return ReadError.EOF_unexpected else break :main_loop,
                 else => {
                     print("{any}\n", .{err});
@@ -1005,33 +1027,17 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
         }
     }
 
-    // return py.Py_NewRef(py.Py_None());
     return capsule_tuple;
 }
 
 const ReadError = error{ DecimalChanged, TimezoneChanged, EOF_unexpected, EOF_expected, file_error, malformed_value, no_memory };
 
-inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, file: std.fs.File, comptime format: formats_sql) !void {
-    const prefix_read = file.read(state.buffer.prefix) catch return ReadError.file_error;
-    if (prefix_read < state.buffer.prefix.len) {
-        if (prefix_read > 0) {
-            return ReadError.EOF_unexpected;
-        }
+inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptime format: formats_sql) !void {
+    const types = format_info_sql.types.get(format);
+    var prefix: types.prefix = undefined;
+    if (!try state.read(&prefix)) {
         return ReadError.EOF_expected;
     }
-    const prefix: i64 = switch (state.buffer.prefix.len) {
-        1 => blk: {
-            const ptr: *i8 = @ptrCast(state.buffer.prefix.ptr);
-            break :blk ptr.*;
-        },
-        // 8 => blk: {
-        //     // print("align{}\n", .{@alignOf(state.buffer.prefix.ptr)});
-        //     const ptr: *i64 = @alignCast(@ptrCast(state.buffer.prefix.ptr));
-        //     break :blk ptr.*;
-        // },
-        8 => std.mem.readInt(i64, state.buffer.prefix[0..8], .little),
-        else => unreachable,
-    };
     print("prefix: {}\n", .{prefix});
 
     arr.length += 1;
@@ -1041,38 +1047,27 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, file: s
         return;
     }
 
-    if (format == .binary or format == .char) {
+    if (comptime format == .binary or format == .char) {
         const data_buffer_ptr: [*]u8 = @alignCast(@ptrCast(arr.buffers[2].?));
-        const data_buffer = data_buffer_ptr[0..arr.length_data_buffer];
         const main_buffer_ptr: [*]u32 = @alignCast(@ptrCast(arr.buffers[1].?));
         const last_index = main_buffer_ptr[i_row];
         const target_index = last_index + (std.math.cast(u32, prefix) orelse return ReadError.malformed_value);
         main_buffer_ptr[i_row + 1] = target_index;
         print("data buffer {} {} {}\n", .{ last_index, target_index, arr.length_data_buffer });
-        if (target_index > data_buffer.len) {
+        if (target_index > arr.length_data_buffer) {
+            // TODO realloc
             unreachable;
         }
-        if (target_index - last_index != (file.read(data_buffer[last_index..target_index]) catch return ReadError.file_error)) {
+        if (!try state.read(data_buffer_ptr[last_index..target_index])) {
             return ReadError.EOF_unexpected;
         }
         return;
     }
 
-    const data_read = file.read(state.buffer.data) catch return ReadError.file_error;
-    if (data_read != state.buffer.data.len) {
+    var bcp_value: types.bcp = undefined;
+    if (!try state.read(&bcp_value)) {
         return ReadError.EOF_unexpected;
     }
-    print("state.buffer.data: bytes: {any}\n", .{state.buffer.data});
-
-    const types = format_info_sql.types.get(format);
-    std.debug.assert(@divExact(@bitSizeOf(types.bcp), 8) == state.buffer.data.len);
-    // const bcp_ptr: *types.bcp = @alignCast(@ptrCast(state.buffer.data.ptr));
-    // const bcp_value = bcp_ptr.*;
-    var bcp_value: types.bcp = undefined;
-
-    print("{any} {any}\n", .{ std.mem.asBytes(&bcp_value), state.buffer.data.len });
-    @memcpy(std.mem.asBytes(&bcp_value).ptr, state.buffer.data);
-    // var v: u32 = undefined; @memcpy(std.mem.asBytes(&v), ptr[0…4]);
 
     if (comptime format == .bit) {
         // TODO maybe sanity check if there are funny values
