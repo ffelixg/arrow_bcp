@@ -29,16 +29,30 @@ const Decimal = packed struct {
 };
 
 const DateTime64 = packed struct {
+    /// unit is 100ns
     time: u40,
     date: u24,
 
-    inline fn from_ns_factor(val: i64, ns_factor: i64) DateTime64 {
+    inline fn from_ns_factor(val: i64, ns_factor: i64) !DateTime64 {
         const as_ns = val * ns_factor;
         const ns_in_day = 1000 * 1000 * 1000 * 60 * 60 * 24;
         return DateTime64{
-            .date = @intCast(@divFloor(as_ns, ns_in_day) + 719162),
+            .date = try DateTime64.date_arrow_to_bcp(@divFloor(as_ns, ns_in_day)),
             .time = @intCast(@divFloor(@mod(as_ns, ns_in_day), 100)),
         };
+    }
+
+    inline fn date_arrow_to_bcp(val_arrow: anytype) !u24 {
+        return std.math.cast(u24, val_arrow + 719162) orelse return WriteError.int_cast;
+    }
+
+    inline fn date_bcp_to_arrow(val_bcp: u24) i32 {
+        return val_bcp - 719162;
+    }
+
+    inline fn to_ns(self: DateTime64) i64 {
+        const ns_in_day = 1000 * 1000 * 1000 * 60 * 60 * 24;
+        return @as(i64, date_bcp_to_arrow(self.date)) * ns_in_day + @as(i64, self.time) * 100;
     }
 };
 
@@ -47,8 +61,8 @@ const DateTimeOffset = packed struct {
     date: u24,
     offset: i16,
 
-    inline fn from_ns_factor(val: i64, ns_factor: i64, offset: i16) DateTimeOffset {
-        const dt64 = DateTime64.from_ns_factor(val, ns_factor);
+    inline fn from_ns_factor(val: i64, ns_factor: i64, offset: i16) !DateTimeOffset {
+        const dt64 = try DateTime64.from_ns_factor(val, ns_factor);
         return DateTimeOffset{
             .time = dt64.time,
             .date = dt64.date,
@@ -77,40 +91,54 @@ const ArrowSchema = extern struct {
     // Release callback
     release: ?*fn (*ArrowSchema) void = @constCast(&dummy_release_schema),
     // Opaque producer-specific data
-    private_data: *SchemaProducer,
+    private_data: ?*anyopaque = null,
 };
 
-const SchemaProducer = struct {
+fn release_state(state: *StateContainer) void {
+    state.arena.deinit();
+    state.file.close();
+}
+const StateContainer = struct {
+    arena: std.heap.ArenaAllocator,
+    columns: []ReaderState,
+    buffer: [19]u8 = undefined,
+    file: std.fs.File,
+    release: ?*fn (*StateContainer) void = @constCast(&release_state),
+};
+
+const ReaderState = struct {
+    parent: *StateContainer,
     schema: *ArrowSchema,
     decimal: ?struct { size: u8, precision: u8 } = null,
     offset: ?i16 = null,
-    arena: std.heap.ArenaAllocator,
     sql: struct {
         format: formats_sql,
         size_prefix: u32,
         size_data: u32,
     },
+    buffer: struct {
+        prefix: []u8,
+        data: []u8,
+        has_data_buffer: bool,
+    },
+    read_cell: type_read_cell,
 
-    fn deinit(self: SchemaProducer) void {
-        self.arena.deinit();
-    }
-
-    fn validate_decimal(self: *SchemaProducer, size: u8, precision: u8) !void {
+    fn validate_decimal(self: *ReaderState, size: u8, precision: u8) !void {
         if (self.decimal) |dec| {
             if (size != dec.size or precision != dec.precision) {
                 return ReadError.DecimalChanged;
             }
         } else {
             self.decimal = .{ .size = size, .precision = precision };
-            self.schema.format = try std.fmt.allocPrintZ(
-                self.arena.allocator(),
-                "d:{}:{}",
-                .{ precision, size },
-            );
+            self.schema.format = std.fmt.allocPrintZ(
+                self.parent.arena.allocator(),
+                "d:{},{}",
+                .{ size, precision },
+            ) catch return ReadError.no_memory;
         }
     }
 
-    fn validate_timezone(self: *SchemaProducer, offset: i16) !void {
+    fn validate_timezone(self: *ReaderState, offset: i16) !void {
         if (self.offset) |off| {
             if (off != offset) {
                 return ReadError.TimezoneChanged;
@@ -123,42 +151,21 @@ const SchemaProducer = struct {
             };
             const hours: i16 = @divFloor(offset, 60);
             const minutes: i16 = @mod(offset, 60);
-            self.schema.format = try std.fmt.allocPrintZ(
-                self.arena.allocator(),
+            self.schema.format = std.fmt.allocPrintZ(
+                self.parent.arena.allocator(),
                 "tsn:{c}{}{}",
                 .{ sign, hours, minutes },
-            );
+            ) catch return ReadError.no_memory;
         }
-    }
-
-    fn from_capsule(capsule: *PyObject) ?*SchemaProducer {
-        const ptr = py.PyCapsule_GetPointer(capsule, "arrow_schema") orelse return null;
-        const schema: *ArrowSchema = @alignCast(@ptrCast(ptr));
-        return schema.private_data;
-    }
-
-    fn release_capsule(capsule: ?*PyObject) callconv(.C) void {
-        if (capsule) |c| {
-            if (from_capsule(c)) |schema| {
-                schema.deinit();
-            }
-            unreachable;
-        }
-        unreachable;
-    }
-
-    fn to_capsule(self: *SchemaProducer) !*PyObject {
-        return py.PyCapsule_New(
-            @ptrCast(self.schema),
-            "arrow_schema",
-            @constCast(&SchemaProducer.release_capsule),
-        ) orelse return Err.PyError;
     }
 };
 
-fn dummy_release_array(self: *ArrowArray) void {
-    _ = self;
-    unreachable; // handled by capsule
+fn release_array(self: *ArrowArray) void {
+    for (self.buffers[0..@intCast(self.n_buffers)]) |buf| {
+        std.c.free(buf);
+    }
+    std.c.free(@ptrCast(self.buffers));
+    self.release = null;
 }
 
 const ArrowArray = extern struct {
@@ -173,10 +180,46 @@ const ArrowArray = extern struct {
     dictionary: ?[*]ArrowArray = null,
 
     // Release callback
-    release: ?*fn (*ArrowArray) void = @constCast(&dummy_release_array),
-    // Opaque producer-specific data
-    producer: *ArrayProducer,
+    release: ?*fn (*ArrowArray) void = @constCast(&release_array),
+    // Opaque producer-specific data, must be pointer sized
+    // private_data: ?*anyopaque = null,
+    length_data_buffer: usize,
 };
+
+fn capsule_name(T: type) [*c]const u8 {
+    return switch (T) {
+        ArrowArray => "arrow_array",
+        ArrowSchema => "arrow_schema",
+        StateContainer => "arrow_bcp_reader_state",
+        else => unreachable,
+    };
+}
+
+fn from_capsule(T: type, capsule: *PyObject) ?*T {
+    const ptr = py.PyCapsule_GetPointer(capsule, capsule_name(T)) orelse return null;
+    return @alignCast(@ptrCast(ptr));
+}
+
+fn to_capsule(c_data: anytype) !*PyObject {
+    const T = @typeInfo(@TypeOf(c_data)).Pointer.child;
+    const dummy = struct {
+        fn release_capsule(capsule: ?*PyObject) callconv(.C) void {
+            if (capsule) |c| {
+                if (from_capsule(T, c)) |c_data_inner| {
+                    if (c_data_inner.release) |release| {
+                        release(c_data_inner);
+                    }
+                    malloc.destroy(c_data_inner);
+                }
+            }
+        }
+    };
+    return py.PyCapsule_New(
+        @ptrCast(c_data),
+        capsule_name(T),
+        @constCast(&dummy.release_capsule),
+    ) orelse return Err.PyError;
+}
 
 const ArrowError = error{MissingBuffer};
 const Err = error{PyError};
@@ -199,6 +242,9 @@ fn raise_args(exc: Exceptions, comptime msg: []const u8, args: anytype) Err {
 fn raise(exc: Exceptions, comptime msg: []const u8) Err {
     return raise_args(exc, msg, .{});
 }
+
+// I think this is required because of arrow's data moving behavior
+const malloc = std.heap.raw_c_allocator;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{
     .safety = true,
@@ -451,6 +497,16 @@ inline fn bit_get(ptr: anytype, index: anytype) bool {
     return 0 == (ptr_cast[@divFloor(index, 8)] & (@as(u8, 1) << selector));
 }
 
+inline fn bit_set(ptr: anytype, index: anytype, comptime value: bool) void {
+    const ptr_cast: [*]u8 = @alignCast(@ptrCast(ptr));
+    const selector: u3 = @intCast(index % 8);
+    if (comptime value) {
+        ptr_cast[@divFloor(index, 8)] |= @as(u8, 1) << selector;
+    } else {
+        ptr_cast[@divFloor(index, 8)] &= 0xFF ^ (@as(u8, 1) << selector);
+    }
+}
+
 const WriteError = error{ write_error, missing_buffer, int_cast };
 inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) WriteError!void {
     const types = format_types(format);
@@ -488,14 +544,10 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) Wri
                 .sign = if (val_arrow >= 0) 1 else 0,
                 .int_data = if (val_arrow >= 0) val_arrow else -val_arrow,
             },
-            // TODO raise PyError when it fails
-            inline .date => br: {
-                const x = std.math.cast(types.bcp, val_arrow + 719162) orelse return WriteError.int_cast;
-                break :br x;
-            },
-            inline .datetime => DateTime64.from_ns_factor(val_arrow, 1000 * 1000),
-            inline .timestamp => DateTime64.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns),
-            inline .timestamp_timezone => DateTimeOffset.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns, self.bcp_info.timestamp_timezone_offset),
+            inline .date => try DateTime64.date_arrow_to_bcp(val_arrow),
+            inline .datetime => try DateTime64.from_ns_factor(val_arrow, 1000 * 1000),
+            inline .timestamp => try DateTime64.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns),
+            inline .timestamp_timezone => try DateTimeOffset.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns, self.bcp_info.timestamp_timezone_offset),
             inline .boolean => blk: {
                 const val: types.bcp = @intFromBool(val_arrow);
                 break :blk val;
@@ -593,7 +645,13 @@ fn zig_to_py(value: anytype) !*py.PyObject {
     return switch (info) {
         .Int => if (info.Int.signedness == .signed) py.PyLong_FromLongLong(@as(c_longlong, value)) else py.PyLong_FromUnsignedLongLong(@as(c_ulonglong, value)),
         .ComptimeInt => if (value < 0) py.PyLong_FromLongLong(@as(c_longlong, value)) else py.PyLong_FromUnsignedLongLong(@as(c_ulonglong, value)),
-        .Pointer => py.PyUnicode_FromStringAndSize(value.ptr, @intCast(value.len)),
+        // .Pointer => ,
+        .Pointer => |pinfo| if (pinfo.child == u8)
+            py.PyUnicode_FromStringAndSize(value.ptr, @intCast(value.len))
+        else if (pinfo.child == py.PyObject)
+            py.Py_NewRef(value)
+        else
+            unreachable,
         .Struct => blk: {
             const tuple = py.PyTuple_New(value.len) orelse return Err.PyError;
             errdefer py.Py_DECREF(tuple);
@@ -717,8 +775,13 @@ const formats_sql = enum(u8) {
     binary,
 };
 
-const formatinfo_sql = blk: {
+const type_read_cell = *fn (usize, *ReaderState, *ArrowArray, std.fs.File) ReadError!void;
+
+const format_info_sql = blk: {
     var format_strings = std.EnumArray(formats_sql, []const u8).initUndefined();
+    var readers = std.EnumArray(formats_sql, type_read_cell).initUndefined();
+    var types = std.EnumArray(formats_sql, struct { bcp: type, arrow: type }).initUndefined();
+    var bit_sizes = std.EnumArray(formats_sql, struct { bcp: u15, arrow: u15 }).initUndefined();
     for (std.enums.values(formats_sql)) |fmt| {
         const info = switch (fmt) {
             formats_sql.bit => .{ u8, u1, "b" },
@@ -733,24 +796,31 @@ const formatinfo_sql = blk: {
             formats_sql.datetime2 => .{ DateTime64, i64, "tsn:" },
             formats_sql.datetimeoffset => .{ DateTimeOffset, i64, "n" }, // timezone unknown until first row is read
             formats_sql.uniqueidentifier => .{ [16]u8, [16]u8, "w:16" },
-            formats_sql.char => .{ noreturn, u32, "u" },
-            formats_sql.binary => .{ noreturn, u32, "z" },
+            formats_sql.char => .{ u0, u32, "u" },
+            formats_sql.binary => .{ u0, u32, "z" },
         };
         format_strings.set(fmt, info[2] ++ "\x00");
+        const dummy = struct {
+            fn read_cell_fmt(i_row: usize, state: *ReaderState, arr: *ArrowArray, file: std.fs.File) ReadError!void {
+                return try read_cell(i_row, state, arr, file, fmt);
+            }
+        };
+        readers.set(fmt, @constCast(&dummy.read_cell_fmt));
+        types.set(fmt, .{ .bcp = info[0], .arrow = info[1] });
+        bit_sizes.set(fmt, .{ .bcp = @bitSizeOf(info[0]), .arrow = @bitSizeOf(info[1]) });
     }
-    const T = struct { format_strings: @TypeOf(format_strings) };
-    break :blk T{ .format_strings = format_strings };
-};
-
-const ArrayProducer = struct {
-    array: *ArrowArray,
-    buffer_prefix: []u8,
-    buffer_data: []u8,
-    arena: std.heap.ArenaAllocator,
-    has_data_buffer: bool,
-    fn deinit(self: ArrayProducer) void {
-        _ = self;
-    }
+    const T = struct {
+        format_strings: @TypeOf(format_strings),
+        readers: @TypeOf(readers),
+        types: @TypeOf(types),
+        bit_sizes: @TypeOf(bit_sizes),
+    };
+    break :blk T{
+        .format_strings = format_strings,
+        .readers = readers,
+        .types = types,
+        .bit_sizes = bit_sizes,
+    };
 };
 
 fn init_reader(py_args: ?*PyObject) !*PyObject {
@@ -765,152 +835,273 @@ fn init_reader(py_args: ?*PyObject) !*PyObject {
         break :blk if (len == -1) return Err.PyError else @intCast(len);
     };
 
-    const ret = py.PyTuple_New(@intCast(nr_columns)) orelse return Err.PyError;
-    errdefer py.Py_DECREF(ret);
+    var capsule_has_state_ownership = false;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer if (!capsule_has_state_ownership) arena.deinit();
+    var arena_alloc = arena.allocator();
+    const states = try arena_alloc.alloc(ReaderState, nr_columns);
+    const container = try malloc.create(StateContainer);
+    errdefer if (!capsule_has_state_ownership) malloc.destroy(container);
+    var file = std.fs.openFileAbsoluteZ("/tmp/arrowwrite.dat", .{}) catch {
+        return raise(.Exception, "Error opening file");
+    };
+    errdefer if (!capsule_has_state_ownership) file.close();
+    container.* = .{
+        .arena = arena,
+        .columns = states,
+        .file = file,
+    };
 
-    for (0..nr_columns) |i_col| {
-        const py_bcp_column = py.PySequence_GetItem(args.bcp_columns, @intCast(i_col)) orelse return Err.PyError;
-        defer py.Py_DECREF(py_bcp_column);
+    const schema_capsules = py.PyTuple_New(@intCast(nr_columns)) orelse return Err.PyError;
+    defer py.Py_DECREF(schema_capsules);
 
-        const unpacked = try py_to_zig(
-            struct { sql_type: *py.PyObject, size_prefix: u32, size_data: u32 },
-            py_bcp_column,
-        );
-        defer py.Py_DECREF(unpacked.sql_type);
+    for (states, 0..) |*state, i_col| {
+        const capsule = blk: {
+            const py_bcp_column = py.PySequence_GetItem(args.bcp_columns, @intCast(i_col)) orelse return Err.PyError;
+            defer py.Py_DECREF(py_bcp_column);
 
-        const py_sql_type_int = py.PyDict_GetItem(sql_type_mapping, unpacked.sql_type) orelse return Err.PyError;
-        defer py.Py_DECREF(py_sql_type_int);
-        const format_sql: formats_sql = @enumFromInt(try py_to_zig(c_ulonglong, py_sql_type_int));
+            const unpacked = try py_to_zig(
+                struct { sql_type: *py.PyObject, size_prefix: u32, size_data: u32 },
+                py_bcp_column,
+            );
+            defer py.Py_DECREF(unpacked.sql_type);
 
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        var arena_alloc = arena.allocator();
+            const py_sql_type_int = py.PyDict_GetItem(sql_type_mapping, unpacked.sql_type) orelse return Err.PyError;
+            defer py.Py_DECREF(py_sql_type_int);
+            const format_sql: formats_sql = @enumFromInt(try py_to_zig(c_ulonglong, py_sql_type_int));
 
-        const schema = try arena_alloc.create(ArrowSchema);
-        schema.* = .{
-            .format = @ptrCast(formatinfo_sql.format_strings.get(format_sql).ptr),
-            .private_data = undefined,
+            const schema = try malloc.create(ArrowSchema);
+            errdefer malloc.destroy(schema);
+            schema.* = .{
+                .format = @ptrCast(format_info_sql.format_strings.get(format_sql).ptr),
+            };
+
+            state.* = .{
+                .parent = container,
+                .schema = schema,
+                .sql = .{
+                    .format = format_sql,
+                    .size_data = unpacked.size_data,
+                    .size_prefix = unpacked.size_prefix,
+                },
+                .buffer = .{
+                    .data = container.buffer[0..unpacked.size_data],
+                    .prefix = container.buffer[0..unpacked.size_prefix],
+                    .has_data_buffer = switch (format_sql) {
+                        .char, .binary => true,
+                        else => false,
+                    },
+                },
+                .read_cell = format_info_sql.readers.get(format_sql),
+            };
+
+            print("col {any}\n", .{state.*});
+
+            break :blk try to_capsule(schema);
         };
-
-        const producer_data = try arena_alloc.create(SchemaProducer);
-        producer_data.* = .{
-            .schema = schema,
-            .sql = .{
-                .format = format_sql,
-                .size_data = unpacked.size_data,
-                .size_prefix = unpacked.size_prefix,
-            },
-            .arena = arena,
-        };
-
-        schema.private_data = producer_data;
-
-        print("col {any}\n", .{producer_data.*});
-
-        const capsule = try producer_data.to_capsule();
         errdefer py.Py_DECREF(capsule);
-        if (py.PyTuple_SetItem(ret, @intCast(i_col), capsule) == -1) {
+        if (py.PyTuple_SetItem(schema_capsules, @intCast(i_col), capsule) == -1) {
             return Err.PyError;
         }
     }
 
-    return ret;
+    const state_capsule = try to_capsule(container);
+    defer py.Py_DECREF(state_capsule);
+    capsule_has_state_ownership = true;
+
+    return try zig_to_py(.{ schema_capsules, state_capsule });
 }
+
+const malloc_error = error{mem};
 
 fn read_batch(py_args: ?*PyObject) !*PyObject {
     const args = try py_to_zig(
-        struct { schema_capsules: *PyObject, rows_max: u32 },
+        struct { state_capsule: *PyObject, rows_max: u32 },
         py_args orelse return raise(.Exception, "No arguments passed"),
     );
-    defer py.Py_DECREF(args.schema_capsules);
+    const rows_max_rounded: u32 = 512 * try std.math.divCeil(u32, args.rows_max + 1, 512);
+    defer py.Py_DECREF(args.state_capsule);
+    const state: *StateContainer = from_capsule(StateContainer, args.state_capsule).?;
+    print("hhfjklad\n{any}\n", .{state});
+    print("hhfjklad\n{any}\n", .{state.columns[0]});
 
-    const nr_columns: usize = blk: {
-        const len = py.PyObject_Length(args.schema_capsules);
-        break :blk if (len == -1) return Err.PyError else @intCast(len);
-    };
+    const nr_columns = state.columns.len;
 
-    const schemas = allocator.alloc(*SchemaProducer, nr_columns) catch {
+    var arrays = malloc.alloc(*ArrowArray, nr_columns) catch {
         _ = py.PyErr_NoMemory();
         return Err.PyError;
     };
-    defer allocator.free(schemas);
-
-    for (schemas, 0..) |*schema, i_schema| {
-        const capsule = py.PySequence_GetItem(args.schema_capsules, @intCast(i_schema)) orelse return Err.PyError;
-        defer py.Py_DECREF(capsule);
-        schema.* = SchemaProducer.from_capsule(capsule) orelse return raise(.Exception, "Could not read schema capsule");
-    }
-
-    var arrays = allocator.alloc(*ArrayProducer, nr_columns) catch {
-        _ = py.PyErr_NoMemory();
-        return Err.PyError;
-    };
-    defer allocator.free(arrays);
+    defer malloc.free(arrays);
     var n_allocated_columns: usize = 0;
     errdefer for (arrays[0..n_allocated_columns]) |array| {
-        array.deinit();
+        array.release.?(array);
+        malloc.destroy(array);
     };
 
-    var sql_read_buffer: [19]u8 = undefined;
+    for (arrays[0..nr_columns], state.columns) |*arr_ptr, state_col| {
+        const n_buffers: u7 = if (state_col.buffer.has_data_buffer) 3 else 2;
+        // const buffers = std.c.malloc(@sizeOf(*anyopaque) * n_buffers) orelse return malloc_error.mem;
+        const buffers = try malloc.alloc(*anyopaque, n_buffers);
+        errdefer malloc.free(buffers);
 
-    for (arrays[0..nr_columns], schemas) |*col, schema| {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        var arena_alloc = arena.allocator();
+        const valid_buffer = try malloc.alloc(u8, @divExact(rows_max_rounded, 8));
+        errdefer malloc.free(valid_buffer);
+        @memset(valid_buffer, 0xFF);
+        buffers[0] = valid_buffer.ptr;
 
-        const producer_data = try arena_alloc.create(ArrayProducer);
-        producer_data.* = .{
-            .array = undefined,
-            .buffer_prefix = sql_read_buffer[0..schema.sql.size_prefix],
-            .buffer_data = sql_read_buffer[0..schema.sql.size_data],
-            .arena = arena,
-            .has_data_buffer = switch (schema.sql.format) {
-                formats_sql.binary, formats_sql.char => true,
-                else => false,
-            },
-        };
+        const value_buffer = try malloc.alloc(u8, format_info_sql.bit_sizes.get(state_col.sql.format).arrow * @divExact(rows_max_rounded, 8));
+        errdefer malloc.free(value_buffer);
+        buffers[1] = value_buffer.ptr;
 
-        const buffers = try arena_alloc.alloc(*anyopaque, if (producer_data.has_data_buffer) 3 else 2);
+        const data_buffer: ?[]u8 = if (state_col.buffer.has_data_buffer)
+            try malloc.alloc(u8, args.rows_max * 42)
+        else
+            null;
+        errdefer if (data_buffer) |buf| malloc.free(buf);
+        if (data_buffer) |buf| {
+            @memset(value_buffer[0..4], 0);
+            // value_buffer[0] = 0;
+            buffers[2] = buf.ptr;
+        }
 
-        const array = try arena_alloc.create(ArrowArray);
+        const array = try malloc.create(ArrowArray);
+        errdefer malloc.destroy(array);
         array.* = .{
             .buffers = @alignCast(@ptrCast(buffers.ptr)),
-            .length = args.rows_max,
+            .length = 0,
             .n_buffers = @intCast(buffers.len),
             .null_count = 0,
-            .producer = producer_data,
+            .length_data_buffer = if (data_buffer) |buf| buf.len else 0,
         };
-        producer_data.array = array;
 
         // pass ownership, do not run into errdefer afterwards
-        col.* = producer_data;
+        arr_ptr.* = array;
         n_allocated_columns += 1;
-        print("col {any}\n", .{col.*});
+        print("col {any}\n", .{arr_ptr.*});
     }
-    var file = std.fs.openFileAbsoluteZ("/tmp/arrowwrite.dat", .{}) catch {
-        return raise(.Exception, "Error opening file");
-    };
-    defer file.close();
 
-    // main_loop: while (true) {
-    for (arrays, 0..) |col, i_col| {
-        _ = i_col;
-        try read_cell(col, file);
+    main_loop: for (0..args.rows_max) |i_row| {
+        for (arrays, state.columns, 0..) |arr, *st, i_col| {
+            print("i_col {}\n", .{i_col});
+            st.read_cell(i_row, st, arr, state.file) catch |err| switch (err) {
+                ReadError.EOF_expected => if (i_col != 0) return ReadError.EOF_unexpected else break :main_loop,
+                else => {
+                    print("{any}\n", .{err});
+                    unreachable;
+                },
+            };
+        }
     }
-    // }
 
-    return py.Py_NewRef(py.Py_None());
+    const capsule_tuple = py.PyTuple_New(@intCast(nr_columns)) orelse return Err.PyError;
+    errdefer py.Py_DECREF(capsule_tuple);
+    for (0..nr_columns) |i_col| {
+        const i_col_reverse = nr_columns - 1 - i_col;
+        const capsule = try to_capsule(arrays[i_col_reverse]);
+        n_allocated_columns -= 1; // transfer ownership
+        if (py.PyTuple_SetItem(capsule_tuple, @intCast(i_col_reverse), capsule) == -1) {
+            py.Py_DECREF(capsule);
+            return Err.PyError;
+        }
+    }
+
+    // return py.Py_NewRef(py.Py_None());
+    return capsule_tuple;
 }
 
-const ReadError = error{ DecimalChanged, TimezoneChanged };
+const ReadError = error{ DecimalChanged, TimezoneChanged, EOF_unexpected, EOF_expected, file_error, malformed_value, no_memory };
 
-// fn read_cell(arr: *ArrowArray, file: std.fs.File) !void {
-fn read_cell(col: *ArrayProducer, file: std.fs.File) !void {
-    // const col: *ReaderColumn = @alignCast(@ptrCast(arr.producer));
-    const prefix_read = try file.read(col.buffer_prefix);
-    print("col.buffer_prefix: {}, bytes: {any}\n", .{ prefix_read, col.buffer_prefix });
-    const data_read = try file.read(col.buffer_data);
-    print("col.buffer_data: {}, bytes: {any}\n", .{ data_read, col.buffer_data });
+inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, file: std.fs.File, comptime format: formats_sql) !void {
+    const prefix_read = file.read(state.buffer.prefix) catch return ReadError.file_error;
+    if (prefix_read < state.buffer.prefix.len) {
+        if (prefix_read > 0) {
+            return ReadError.EOF_unexpected;
+        }
+        return ReadError.EOF_expected;
+    }
+    const prefix: i64 = switch (state.buffer.prefix.len) {
+        1 => blk: {
+            const ptr: *i8 = @ptrCast(state.buffer.prefix.ptr);
+            break :blk ptr.*;
+        },
+        // 8 => blk: {
+        //     // print("align{}\n", .{@alignOf(state.buffer.prefix.ptr)});
+        //     const ptr: *i64 = @alignCast(@ptrCast(state.buffer.prefix.ptr));
+        //     break :blk ptr.*;
+        // },
+        8 => std.mem.readInt(i64, state.buffer.prefix[0..8], .little),
+        else => unreachable,
+    };
+    print("prefix: {}\n", .{prefix});
+
+    arr.length += 1;
+    if (prefix == -1) {
+        bit_set(arr.buffers[0], i_row, false);
+        arr.null_count += 1;
+        return;
+    }
+
+    if (format == .binary or format == .char) {
+        const data_buffer_ptr: [*]u8 = @alignCast(@ptrCast(arr.buffers[2].?));
+        const data_buffer = data_buffer_ptr[0..arr.length_data_buffer];
+        const main_buffer_ptr: [*]u32 = @alignCast(@ptrCast(arr.buffers[1].?));
+        const last_index = main_buffer_ptr[i_row];
+        const target_index = last_index + (std.math.cast(u32, prefix) orelse return ReadError.malformed_value);
+        main_buffer_ptr[i_row + 1] = target_index;
+        print("data buffer {} {} {}\n", .{ last_index, target_index, arr.length_data_buffer });
+        if (target_index > data_buffer.len) {
+            unreachable;
+        }
+        if (target_index - last_index != (file.read(data_buffer[last_index..target_index]) catch return ReadError.file_error)) {
+            return ReadError.EOF_unexpected;
+        }
+        return;
+    }
+
+    const data_read = file.read(state.buffer.data) catch return ReadError.file_error;
+    if (data_read != state.buffer.data.len) {
+        return ReadError.EOF_unexpected;
+    }
+    print("state.buffer.data: bytes: {any}\n", .{state.buffer.data});
+
+    const types = format_info_sql.types.get(format);
+    std.debug.assert(@divExact(@bitSizeOf(types.bcp), 8) == state.buffer.data.len);
+    // const bcp_ptr: *types.bcp = @alignCast(@ptrCast(state.buffer.data.ptr));
+    // const bcp_value = bcp_ptr.*;
+    var bcp_value: types.bcp = undefined;
+
+    print("{any} {any}\n", .{ std.mem.asBytes(&bcp_value), state.buffer.data.len });
+    @memcpy(std.mem.asBytes(&bcp_value).ptr, state.buffer.data);
+    // var v: u32 = undefined; @memcpy(std.mem.asBytes(&v), ptr[0…4]);
+
+    if (comptime format == .bit) {
+        // TODO maybe sanity check if there are funny values
+        if (bcp_value == 0) {
+            bit_set(arr.buffers[1].?, i_row, true);
+        } else {
+            bit_set(arr.buffers[1].?, i_row, false);
+        }
+        return;
+    }
+
+    const arrow_value: types.arrow = switch (format) {
+        inline .decimal => blk: {
+            const val = switch (bcp_value.sign) {
+                1 => @as(i128, 1),
+                0 => @as(i128, -1),
+                else => return ReadError.malformed_value,
+            } * bcp_value.int_data;
+            try state.validate_decimal(bcp_value.size, bcp_value.precision);
+            break :blk val;
+        },
+        inline .date => DateTime64.date_bcp_to_arrow(bcp_value),
+        inline .datetime2 => bcp_value.to_ns(),
+        inline .datetimeoffset => (DateTime64{ .date = bcp_value.date, .time = bcp_value.time }).to_ns(),
+        inline else => @as(types.arrow, bcp_value),
+    };
+
+    const main_buffer: [*]types.arrow = @alignCast(@ptrCast(arr.buffers[1].?));
+    main_buffer[i_row] = arrow_value;
 }
 
 fn ext_init_reader(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject {
@@ -937,7 +1128,7 @@ var ZamlMethods = [_]PyMethodDef{
         .ml_doc = "Prepare reader.",
     },
     PyMethodDef{
-        .ml_name = "read_arrow",
+        .ml_name = "read_batch",
         .ml_meth = ext_read_batch,
         .ml_flags = py.METH_VARARGS,
         .ml_doc = "Read from disk to arrow capsules.",
