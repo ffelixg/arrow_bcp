@@ -685,13 +685,16 @@ fn zig_to_py(value: anytype) !*py.PyObject {
     } orelse return Err.PyError;
 }
 
-fn write_arrow(args: ?*PyObject) !?*PyObject {
-    const list_schema_capsules = py.PySequence_GetItem(args, 0) orelse return Err.PyError;
-    defer py.Py_DECREF(list_schema_capsules);
-    const list_array_capsule_generators = py.PySequence_GetItem(args, 1) orelse return Err.PyError;
-    defer py.Py_DECREF(list_array_capsule_generators);
+fn write_arrow(py_args: ?*PyObject) !?*PyObject {
+    const args = try py_to_zig(struct {
+        schema_capsules: *PyObject,
+        array_generators: *PyObject,
+        path: []const u8,
+    }, py_args.?);
+    defer py.Py_DECREF(args.schema_capsules);
+    defer py.Py_DECREF(args.array_generators);
     const nr_columns: usize = blk: {
-        const len = py.PyObject_Length(list_schema_capsules);
+        const len = py.PyObject_Length(args.schema_capsules);
         break :blk if (len == -1) return Err.PyError else @intCast(len);
     };
     var columns = allocator.alloc(Column, nr_columns) catch {
@@ -705,9 +708,9 @@ fn write_arrow(args: ?*PyObject) !?*PyObject {
     };
     const columns_slice = columns[0..nr_columns];
     for (columns_slice, 0..) |*col, i_col| {
-        const capsule_schema = py.PySequence_GetItem(list_schema_capsules, @intCast(i_col)) orelse return Err.PyError;
+        const capsule_schema = py.PySequence_GetItem(args.schema_capsules, @intCast(i_col)) orelse return Err.PyError;
         defer py.Py_DECREF(capsule_schema);
-        const chunk_generator = py.PySequence_GetItem(list_array_capsule_generators, @intCast(i_col)) orelse return Err.PyError;
+        const chunk_generator = py.PySequence_GetItem(args.array_generators, @intCast(i_col)) orelse return Err.PyError;
         defer py.Py_DECREF(chunk_generator);
         const schema_ptr = py.PyCapsule_GetPointer(capsule_schema, "arrow_schema") orelse return Err.PyError;
         const schema: *ArrowSchema = @alignCast(@ptrCast(schema_ptr));
@@ -730,7 +733,7 @@ fn write_arrow(args: ?*PyObject) !?*PyObject {
         const fmt = col.schema.format[0..std.mem.len(col.schema.format)];
         col.bcp_info = try BcpInfo.from_format(fmt);
     }
-    var file = std.fs.createFileAbsoluteZ("/tmp/arrowwrite.dat", .{}) catch {
+    var file = std.fs.createFileAbsolute(args.path, .{}) catch {
         return raise(.Exception, "Error opening file");
     };
     defer file.close();
@@ -756,7 +759,7 @@ fn write_arrow(args: ?*PyObject) !?*PyObject {
         const item = try zig_to_py(.{
             col.bcp_info.dtype_name,
             sizes.prefix,
-            sizes.bcp,
+            if (col.bcp_info.format == .bytes) 0 else sizes.bcp,
         });
         defer py.Py_DECREF(item);
         if (py.PyList_Append(format_list, item) == -1) {
@@ -856,7 +859,7 @@ const format_info_sql = blk: {
 
 fn init_reader(py_args: ?*PyObject) !*PyObject {
     const args = try py_to_zig(
-        struct { bcp_columns: *PyObject },
+        struct { bcp_columns: *PyObject, path: []const u8 },
         py_args orelse return raise(.Exception, "No arguments passed"),
     );
     defer py.Py_DECREF(args.bcp_columns);
@@ -873,7 +876,7 @@ fn init_reader(py_args: ?*PyObject) !*PyObject {
     const states = try arena_alloc.alloc(ReaderState, nr_columns);
     const container = try malloc.create(StateContainer);
     errdefer if (!capsule_has_state_ownership) malloc.destroy(container);
-    var file = std.fs.openFileAbsoluteZ("/tmp/arrowwrite.dat", .{}) catch {
+    var file = std.fs.openFileAbsolute(args.path, .{}) catch {
         return raise(.Exception, "Error opening file");
     };
     errdefer if (!capsule_has_state_ownership) file.close();
@@ -1044,16 +1047,17 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
     print("prefix: {}\n", .{prefix});
 
     arr.length += 1;
-    if (prefix == -1) {
-        bit_set(arr.buffers[0], i_row, false);
-        arr.null_count += 1;
-        return;
-    }
 
     if (comptime format == .binary or format == .char) {
         const data_buffer_ptr: [*]u8 = @alignCast(@ptrCast(arr.buffers[2].?));
         const main_buffer_ptr: [*]u32 = @alignCast(@ptrCast(arr.buffers[1].?));
         const last_index = main_buffer_ptr[i_row];
+        if (prefix == -1) {
+            main_buffer_ptr[i_row + 1] = last_index;
+            bit_set(arr.buffers[0], i_row, false);
+            arr.null_count += 1;
+            return;
+        }
         const target_index = last_index + (std.math.cast(u32, prefix) orelse return ReadError.malformed_value);
         main_buffer_ptr[i_row + 1] = target_index;
         print("data buffer {} {} {}\n", .{ last_index, target_index, arr.length_data_buffer });
@@ -1064,6 +1068,12 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
         if (!try state.read(data_buffer_ptr[last_index..target_index])) {
             return ReadError.EOF_unexpected;
         }
+        return;
+    }
+
+    if (prefix == -1) {
+        bit_set(arr.buffers[0], i_row, false);
+        arr.null_count += 1;
         return;
     }
 
@@ -1118,7 +1128,7 @@ fn ext_read_batch(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject 
     };
 }
 
-var ZamlMethods = [_]PyMethodDef{
+var zig_ext_methods = [_]PyMethodDef{
     PyMethodDef{
         .ml_name = "init_reader",
         .ml_meth = ext_init_reader,
@@ -1145,7 +1155,7 @@ var ZamlMethods = [_]PyMethodDef{
     },
 };
 
-var zamlmodule = PyModuleDef{
+var zig_ext_module = PyModuleDef{
     .m_base = PyModuleDef_Base{
         .ob_base = PyObject{
             // .ob_refcnt = 1,
@@ -1156,16 +1166,16 @@ var zamlmodule = PyModuleDef{
         .m_copy = null,
     },
     // { {  { 1 }, (nullptr) }, nullptr, 0, nullptr, }
-    .m_name = "zaml",
+    .m_name = "zig_ext",
     .m_doc = null,
     .m_size = -1,
-    .m_methods = &ZamlMethods,
+    .m_methods = &zig_ext_methods,
     .m_slots = null,
     .m_traverse = null,
     .m_clear = null,
     .m_free = null,
 };
 
-pub export fn PyInit_zaml() ?*PyObject {
-    return PyModule_Create(&zamlmodule);
+pub export fn PyInit_zig_ext() ?*PyObject {
+    return PyModule_Create(&zig_ext_module);
 }

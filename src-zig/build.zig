@@ -1,4 +1,5 @@
 const std = @import("std");
+const include_paths = @import("include_dirs.zig");
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -17,18 +18,17 @@ pub fn build(b: *std.Build) void {
 
     // const lib = b.addStaticLibrary(.{
     const lib = b.addSharedLibrary(.{
-        .name = "ziggin",
+        .name = "zig_ext",
         // In this case the main source file is merely a path, however, in more
         // complicated build scripts, this could be a generated file.
-        .root_source_file = b.path("src/root.zig"),
-        // .root_source_file = .{ .path = "src/root.zig" },
+        .root_source_file = b.path("zig_ext.zig"),
         .target = target,
         .optimize = optimize,
     });
     lib.linkLibC();
-    // lib.addIncludePath(.{ .path = "/home/felix/.anaconda3/envs/newenv2/include/python3.12" });
-    // lib.addIncludePath(b.path("/home/felix/.anaconda3/envs/newenv2/include/python3.12"));
-    lib.addIncludePath(.{ .cwd_relative = "/home/felix/.anaconda3/envs/newenv2/include/python3.12" });
+    inline for (include_paths.paths) |path| {
+        lib.addIncludePath(.{ .cwd_relative = path });
+    }
     lib.linker_allow_shlib_undefined = true;
 
     // This declares intent for the library to be installed into the standard
@@ -39,8 +39,7 @@ pub fn build(b: *std.Build) void {
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const lib_unit_tests = b.addTest(.{
-        // .root_source_file = .{ .path = "src/root.zig" },
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("zig_ext.zig"),
         .target = target,
         .optimize = optimize,
     });

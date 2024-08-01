@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools", "ziglang"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arrow_bcp"
+authors = [{name = "Felix Graßl"}]
+description = "Transfer data between pyarrow and SQL Server using Microsoft's Bulk Copy Program"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["bcp", "arrow", "mssql", "sql server"]
+license = {text = "MIT"}
+classifiers = ["Programming Language :: Python :: 3"]
+dependencies = ["pyarrow"]
+dynamic = ["version"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -6,3 +6,5 @@
 *.pyc
 *.so
 *.zon
+**/build/**
+**/*egg-info/**
