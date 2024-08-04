@@ -107,7 +107,7 @@ const StateContainer = struct {
 
 const ReaderState = struct {
     parent: *StateContainer,
-    schema: *ArrowSchema,
+    schema_format: []const u8,
     decimal: ?struct { size: u8, precision: u8 } = null,
     offset: ?i16 = null,
     format: formats_sql,
@@ -146,7 +146,7 @@ const ReaderState = struct {
             }
         } else {
             self.decimal = .{ .size = size, .precision = precision };
-            self.schema.format = std.fmt.allocPrintZ(
+            self.schema_format = std.fmt.allocPrintZ(
                 self.parent.arena.allocator(),
                 "d:{},{}",
                 .{ size, precision },
@@ -167,12 +167,18 @@ const ReaderState = struct {
             };
             const hours: i16 = @divFloor(offset, 60);
             const minutes: i16 = @mod(offset, 60);
-            self.schema.format = std.fmt.allocPrintZ(
+            self.schema_format = std.fmt.allocPrintZ(
                 self.parent.arena.allocator(),
                 "tsn:{c}{}{}",
                 .{ sign, hours, minutes },
             ) catch return ReadError.no_memory;
         }
+    }
+
+    fn export_schema(self: *ReaderState) !*ArrowSchema {
+        const schema = try malloc.create(ArrowSchema);
+        schema.* = .{ .format = @ptrCast(self.schema_format.ptr) };
+        return schema;
     }
 };
 
@@ -869,17 +875,16 @@ fn init_reader(py_args: ?*PyObject) !*PyObject {
         break :blk if (len == -1) return Err.PyError else @intCast(len);
     };
 
-    var capsule_has_state_ownership = false;
     var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer if (!capsule_has_state_ownership) arena.deinit();
+    errdefer arena.deinit();
     var arena_alloc = arena.allocator();
     const states = try arena_alloc.alloc(ReaderState, nr_columns);
     const container = try malloc.create(StateContainer);
-    errdefer if (!capsule_has_state_ownership) malloc.destroy(container);
+    errdefer malloc.destroy(container);
     var file = std.fs.openFileAbsolute(args.path, .{}) catch {
         return raise(.Exception, "Error opening file");
     };
-    errdefer if (!capsule_has_state_ownership) file.close();
+    errdefer file.close();
     container.* = .{
         .arena = arena,
         .columns = states,
@@ -890,58 +895,36 @@ fn init_reader(py_args: ?*PyObject) !*PyObject {
     defer py.Py_DECREF(schema_capsules);
 
     for (states, 0..) |*state, i_col| {
-        const capsule = blk: {
-            const py_bcp_column = py.PySequence_GetItem(args.bcp_columns, @intCast(i_col)) orelse return Err.PyError;
-            defer py.Py_DECREF(py_bcp_column);
+        const py_bcp_column = py.PySequence_GetItem(args.bcp_columns, @intCast(i_col)) orelse return Err.PyError;
+        defer py.Py_DECREF(py_bcp_column);
 
-            const unpacked = try py_to_zig(
-                struct { sql_type: []const u8, size_prefix: u32, size_data: u32 },
-                py_bcp_column,
-            );
+        const unpacked = try py_to_zig(
+            struct { sql_type: []const u8, size_prefix: u32, size_data: u32 },
+            py_bcp_column,
+        );
 
-            const format_sql = format_info_sql.enum_from_bcp.get(unpacked.sql_type) orelse return raise_args(.TypeError, "Unsupported SQL type {s}", .{unpacked.sql_type});
-            const bit_sizes = format_info_sql.bit_sizes.get(format_sql);
-            if (format_sql == .binary or format_sql == .char) {
-                if (unpacked.size_data != 0)
-                    return raise_args(.TypeError, "Expected size 0 indicating varbinary/varchar(max), got {}", .{unpacked.size_data});
-            } else {
-                if (unpacked.size_data != @divExact(bit_sizes.bcp, 8))
-                    return raise_args(.TypeError, "Unexpected data size: got {}, expected {}", .{ unpacked.size_data, @divExact(bit_sizes.bcp, 8) });
-            }
-            if (unpacked.size_prefix != @divExact(bit_sizes.prefix, 8))
-                return raise_args(.TypeError, "Unexpected prefix size: got {}, expected {}", .{ unpacked.size_prefix, @divExact(bit_sizes.prefix, 8) });
-
-            const schema = try malloc.create(ArrowSchema);
-            errdefer malloc.destroy(schema);
-            schema.* = .{
-                .format = @ptrCast(format_info_sql.format_strings.get(format_sql).ptr),
-            };
-
-            state.* = .{
-                .parent = container,
-                .schema = schema,
-                .format = format_sql,
-                .read_cell = format_info_sql.readers.get(format_sql),
-            };
-
-            print("col {any}\n", .{state.*});
-
-            break :blk try to_capsule(schema);
-        };
-        errdefer py.Py_DECREF(capsule);
-        if (py.PyTuple_SetItem(schema_capsules, @intCast(i_col), capsule) == -1) {
-            return Err.PyError;
+        const format_sql = format_info_sql.enum_from_bcp.get(unpacked.sql_type) orelse return raise_args(.TypeError, "Unsupported SQL type {s}", .{unpacked.sql_type});
+        const bit_sizes = format_info_sql.bit_sizes.get(format_sql);
+        if (format_sql == .binary or format_sql == .char) {
+            if (unpacked.size_data != 0)
+                return raise_args(.TypeError, "Expected size 0 indicating varbinary/varchar(max), got {}", .{unpacked.size_data});
+        } else {
+            if (unpacked.size_data != @divExact(bit_sizes.bcp, 8))
+                return raise_args(.TypeError, "Unexpected data size: got {}, expected {}", .{ unpacked.size_data, @divExact(bit_sizes.bcp, 8) });
         }
+        if (unpacked.size_prefix != @divExact(bit_sizes.prefix, 8))
+            return raise_args(.TypeError, "Unexpected prefix size: got {}, expected {}", .{ unpacked.size_prefix, @divExact(bit_sizes.prefix, 8) });
+
+        state.* = .{
+            .parent = container,
+            .schema_format = format_info_sql.format_strings.get(format_sql),
+            .format = format_sql,
+            .read_cell = format_info_sql.readers.get(format_sql),
+        };
     }
 
-    const state_capsule = try to_capsule(container);
-    defer py.Py_DECREF(state_capsule);
-    capsule_has_state_ownership = true;
-
-    return try zig_to_py(.{ schema_capsules, state_capsule });
+    return try to_capsule(container);
 }
-
-const malloc_error = error{mem};
 
 fn read_batch(py_args: ?*PyObject) !*PyObject {
     const args = try py_to_zig(
@@ -951,8 +934,6 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
     const rows_max_rounded: u32 = 512 * try std.math.divCeil(u32, args.rows_max + 1, 512);
     defer py.Py_DECREF(args.state_capsule);
     const state: *StateContainer = from_capsule(StateContainer, args.state_capsule).?;
-    print("hhfjklad\n{any}\n", .{state});
-    print("hhfjklad\n{any}\n", .{state.columns[0]});
 
     const nr_columns = state.columns.len;
 
@@ -1025,10 +1006,21 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
     errdefer py.Py_DECREF(capsule_tuple);
     for (0..nr_columns) |i_col| {
         const i_col_reverse = nr_columns - 1 - i_col;
-        const capsule = try to_capsule(arrays[i_col_reverse]);
+        const arr = arrays[i_col_reverse];
+        if (state.columns[i_col_reverse].schema_format[0] == 'n') {
+            for (0..@intCast(arr.n_buffers)) |i_buf| {
+                std.c.free(arr.buffers[i_buf]);
+            }
+            arr.n_buffers = 0;
+        }
+        const array_capsule = try to_capsule(arr);
         n_allocated_columns -= 1; // transfer ownership
-        if (py.PyTuple_SetItem(capsule_tuple, @intCast(i_col_reverse), capsule) == -1) {
-            py.Py_DECREF(capsule);
+        defer py.Py_DECREF(array_capsule);
+        const schema_capsule = try to_capsule(try state.columns[i_col_reverse].export_schema());
+        defer py.Py_DECREF(schema_capsule);
+        const element = try zig_to_py(.{ schema_capsule, array_capsule });
+        if (py.PyTuple_SetItem(capsule_tuple, @intCast(i_col_reverse), element) == -1) {
+            py.Py_DECREF(element);
             return Err.PyError;
         }
     }

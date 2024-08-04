@@ -43,7 +43,7 @@ def dump(batches: typing.Iterable[pa.RecordBatch], path_format: Path, path_data:
 def load(bcp_columns: list[bcp_format.bcpColumn], path_data: Path) -> typing.Generator[pa.RecordBatch, None, None]:
     names = [col.column_name for col in bcp_columns]
 
-    schema_capsules, reader_state = zig_ext.init_reader([
+    reader_state = zig_ext.init_reader([
         (col.type, col.bytes_indicator, col.bytes_data)
         for col in bcp_columns
     ], str(path_data.absolute()))
@@ -51,15 +51,11 @@ def load(bcp_columns: list[bcp_format.bcpColumn], path_data: Path) -> typing.Gen
     go_again = True
     while go_again:
         max_rows = 42
-        array_capsules = zig_ext.read_batch(reader_state, max_rows)
+        capsules = zig_ext.read_batch(reader_state, max_rows)
         arrays = [
             pa.Array._import_from_c_capsule(schema, array)
-            for schema, array in zip(schema_capsules, array_capsules, strict=True)
+            for schema, array in capsules
         ]
         batch = pa.record_batch(arrays, names=names)
-        schema_capsules = [
-            arr.__arrow_c_array__()[0]
-            for arr in batch.columns
-        ]
         go_again = len(batch) == max_rows
         yield batch

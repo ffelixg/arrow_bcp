@@ -111,4 +111,12 @@ class ConnectionInfo:
 
     def download_arrow_table(self, table: str) -> pa.Table:
         with self.download_arrow_batches(table) as reader:
-            return pa.Table.from_batches(reader)
+            batches = [*reader]
+        target_schema = batches[-1].schema
+        for i_batch, batch in enumerate(batches[:-1]):
+            if batch.schema != target_schema:
+                batches[i_batch] = batch.cast(target_schema)
+            else:
+                # once we figured out the schema it will not change anymore
+                break
+        return pa.Table.from_batches(batches)
