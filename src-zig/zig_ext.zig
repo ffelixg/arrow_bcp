@@ -14,13 +14,6 @@ const PyModuleDef_Base = py.PyModuleDef_Base;
 const Py_BuildValue = py.Py_BuildValue;
 const PyModule_Create = py.PyModule_Create;
 
-// TODO maybe use?
-// const Buffer = packed struct {
-//     valid_buffer: ?[*]bool,
-//     main_buffer: ?[*]anyopaque,
-//     data_buffer: ?[*]u8,
-// };
-
 const Decimal = packed struct {
     size: u8,
     precision: u8,
@@ -154,7 +147,8 @@ const ReaderState = struct {
         }
     }
 
-    fn validate_timezone(self: *ReaderState, offset: i16) !void {
+    fn validate_timezone(self: *ReaderState, offset_const: i16) !void {
+        var offset = offset_const;
         if (self.offset) |off| {
             if (off != offset) {
                 return ReadError.TimezoneChanged;
@@ -169,7 +163,7 @@ const ReaderState = struct {
             const minutes: i16 = @mod(offset, 60);
             self.schema_format = std.fmt.allocPrintZ(
                 self.parent.arena.allocator(),
-                "tsn:{c}{}{}",
+                "tsn:{c}{}:{}",
                 .{ sign, hours, minutes },
             ) catch return ReadError.no_memory;
         }
@@ -183,10 +177,12 @@ const ReaderState = struct {
 };
 
 fn release_array(self: *ArrowArray) void {
-    for (self.buffers[0..@intCast(self.n_buffers)]) |buf| {
-        std.c.free(buf);
+    if (self.buffers) |buffers| {
+        for (buffers[0..@intCast(self.n_buffers)]) |buf| {
+            std.c.free(buf);
+        }
+        std.c.free(@ptrCast(buffers));
     }
-    std.c.free(@ptrCast(self.buffers));
     self.release = null;
 }
 
@@ -197,7 +193,7 @@ const ArrowArray = extern struct {
     offset: i64 = 0,
     n_buffers: i64,
     n_children: i64 = 0,
-    buffers: [*]?*anyopaque,
+    buffers: ?[*]?*anyopaque,
     children: ?[*][*]ArrowArray = null,
     dictionary: ?[*]ArrowArray = null,
 
@@ -316,6 +312,7 @@ const BcpInfo = struct {
                 'g' => try BcpInfo.init(.float64, "SQLFLT8"),
                 'z' => try BcpInfo.init(.bytes, "SQLBINARY"),
                 'u' => try BcpInfo.init(.bytes, "SQLCHAR"),
+                'n' => try BcpInfo.init(.null, "SQLBINARY"),
                 else => raise_args(.NotImplemented, "Format '{s}' not implemented", .{fmt}),
             };
         } else {
@@ -426,10 +423,6 @@ const Column = struct {
         if (current_array_ptr.offset != 0) {
             return raise(.NotImplemented, "ArrowArray offset field is not supported");
         }
-        if (current_array_ptr.n_buffers < 2 and current_array_ptr.length > 0) {
-            // TODO add check for data buffer when needed
-            return raise(.Exception, "Too few buffers");
-        }
         self.next_index = 0;
         self.current_array = current_array_ptr.*;
         self._current_array_capsule = py.Py_NewRef(array_capsule);
@@ -437,15 +430,24 @@ const Column = struct {
     }
 
     inline fn valid_buffer(self: *Column) ?[*]bool {
-        return @alignCast(@ptrCast(self.current_array.buffers[0]));
+        if (self.current_array.buffers) |buf| {
+            return @alignCast(@ptrCast(buf[0]));
+        }
+        return null;
     }
 
     inline fn main_buffer(self: *Column, tp: type) ![*]tp {
-        return @alignCast(@ptrCast(self.current_array.buffers[1] orelse return WriteError.missing_buffer));
+        if (self.current_array.buffers) |buf| {
+            return @alignCast(@ptrCast(buf[1] orelse return WriteError.missing_buffer));
+        }
+        return WriteError.missing_buffer;
     }
 
     inline fn data_buffer(self: *Column) ![*]u8 {
-        return @alignCast(@ptrCast(self.current_array.buffers[2] orelse return WriteError.missing_buffer));
+        if (self.current_array.buffers) |buf| {
+            return @alignCast(@ptrCast(buf[2] orelse return WriteError.missing_buffer));
+        }
+        return WriteError.missing_buffer;
     }
 };
 
@@ -468,6 +470,7 @@ const formats = enum(i64) {
     datetime,
     timestamp,
     timestamp_timezone,
+    null,
 };
 
 inline fn format_types(comptime format: formats) struct { prefix: type, arrow: type, bcp: type } {
@@ -490,6 +493,7 @@ inline fn format_types(comptime format: formats) struct { prefix: type, arrow: t
         inline formats.datetime => .{ i8, i64, DateTime64 },
         inline formats.timestamp => .{ i8, i64, DateTime64 },
         inline formats.timestamp_timezone => .{ i8, i64, DateTimeOffset },
+        inline formats.null => .{ i8, i0, i0 },
     };
     return .{
         .prefix = types[0],
@@ -530,16 +534,25 @@ inline fn bit_set(ptr: anytype, index: anytype, comptime value: bool) void {
 }
 
 const WriteError = error{ write_error, missing_buffer, int_cast };
-inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) WriteError!void {
+inline fn write_cell(self: *Column, file: *std.fs.File, comptime format: formats) WriteError!void {
     const types = format_types(format);
     const types_size = comptime format_sizes.get(format);
-    const main_buffer = try self.main_buffer(types.arrow);
+    const main_buffer = if (comptime format != .null)
+        try self.main_buffer(types.arrow)
+    else
+        undefined;
     const bytes_bcp: usize = switch (format) {
         inline .bytes => main_buffer[self.next_index + 1] - main_buffer[self.next_index],
         inline else => types_size.bcp,
     };
 
-    const is_null = if (self.valid_buffer()) |buf| bit_get(buf, self.next_index) else false;
+    const is_null = blk: {
+        if (comptime format == .null) {
+            break :blk true;
+        } else if (self.valid_buffer()) |buf| {
+            break :blk bit_get(buf, self.next_index);
+        } else break :blk false;
+    };
 
     _ = file.write(blk: {
         const val: types.prefix = if (is_null) -1 else @intCast(bytes_bcp);
@@ -589,14 +602,14 @@ inline fn write(self: *Column, file: *std.fs.File, comptime format: formats) Wri
     }
 }
 
-const writer_type = *fn (*Column, *std.fs.File) @typeInfo(@TypeOf(write)).Fn.return_type.?;
+const writer_type = *fn (*Column, *std.fs.File) @typeInfo(@TypeOf(write_cell)).Fn.return_type.?;
 
 const writers = blk: {
     var arr = std.EnumArray(formats, writer_type).initUndefined();
     for (std.enums.values(formats)) |fmt| {
         const dummy = struct {
             fn write_fmt(self: *Column, file: *std.fs.File) !void {
-                try write(self, file, fmt);
+                try write_cell(self, file, fmt);
             }
         };
         arr.set(fmt, @constCast(&dummy.write_fmt));
@@ -998,7 +1011,6 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
         // pass ownership, do not run into errdefer afterwards
         arr_ptr.* = array;
         n_allocated_columns += 1;
-        print("col {any}\n", .{arr_ptr.*});
     }
 
     {
@@ -1024,7 +1036,7 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
         const arr = arrays[i_col_reverse];
         if (state.columns[i_col_reverse].schema_format[0] == 'n') {
             for (0..@intCast(arr.n_buffers)) |i_buf| {
-                std.c.free(arr.buffers[i_buf]);
+                std.c.free(arr.buffers.?[i_buf]);
             }
             arr.n_buffers = 0;
         }
@@ -1051,23 +1063,21 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
     if (!try state.read(&prefix)) {
         return ReadError.EOF_expected;
     }
-    print("prefix: {}\n", .{prefix});
 
     arr.length += 1;
 
     if (comptime format == .binary or format == .char) {
-        const data_buffer_ptr: [*]u8 = @alignCast(@ptrCast(arr.buffers[2].?));
-        const main_buffer_ptr: [*]u32 = @alignCast(@ptrCast(arr.buffers[1].?));
+        const data_buffer_ptr: [*]u8 = @alignCast(@ptrCast(arr.buffers.?[2].?));
+        const main_buffer_ptr: [*]u32 = @alignCast(@ptrCast(arr.buffers.?[1].?));
         const last_index = main_buffer_ptr[i_row];
         if (prefix == -1) {
             main_buffer_ptr[i_row + 1] = last_index;
-            bit_set(arr.buffers[0], i_row, false);
+            bit_set(arr.buffers.?[0], i_row, false);
             arr.null_count += 1;
             return;
         }
         const target_index = last_index + (std.math.cast(u32, prefix) orelse return ReadError.malformed_value);
         main_buffer_ptr[i_row + 1] = target_index;
-        print("data buffer {} {} {}\n", .{ last_index, target_index, arr.length_data_buffer });
         if (target_index > arr.length_data_buffer) {
             // TODO realloc
             unreachable;
@@ -1079,7 +1089,7 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
     }
 
     if (prefix == -1) {
-        bit_set(arr.buffers[0], i_row, false);
+        bit_set(arr.buffers.?[0], i_row, false);
         arr.null_count += 1;
         return;
     }
@@ -1092,9 +1102,9 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
     if (comptime format == .bit) {
         // TODO maybe sanity check if there are funny values
         if (bcp_value == 0) {
-            bit_set(arr.buffers[1].?, i_row, true);
+            bit_set(arr.buffers.?[1].?, i_row, true);
         } else {
-            bit_set(arr.buffers[1].?, i_row, false);
+            bit_set(arr.buffers.?[1].?, i_row, false);
         }
         return;
     }
@@ -1111,11 +1121,14 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
         },
         inline .date => DateTime64.date_bcp_to_arrow(bcp_value),
         inline .datetime2 => bcp_value.to_ns(),
-        inline .datetimeoffset => (DateTime64{ .date = bcp_value.date, .time = bcp_value.time }).to_ns(),
+        inline .datetimeoffset => blk: {
+            try state.validate_timezone(bcp_value.offset);
+            break :blk (DateTime64{ .date = bcp_value.date, .time = bcp_value.time }).to_ns();
+        },
         inline else => @as(types.arrow, bcp_value),
     };
 
-    const main_buffer: [*]types.arrow = @alignCast(@ptrCast(arr.buffers[1].?));
+    const main_buffer: [*]types.arrow = @alignCast(@ptrCast(arr.buffers.?[1].?));
     main_buffer[i_row] = arrow_value;
 }
 
