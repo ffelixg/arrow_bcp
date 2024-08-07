@@ -739,25 +739,37 @@ fn write_arrow(py_args: ?*PyObject) !?*PyObject {
         const fmt = col.schema.format[0..std.mem.len(col.schema.format)];
         col.bcp_info = try BcpInfo.from_format(fmt);
     }
-    var file = std.fs.createFileAbsolute(args.path, .{}) catch {
-        return raise(.Exception, "Error opening file");
-    };
-    defer file.close();
-    main_loop: while (true) {
-        for (columns_slice, 0..) |*col, i_col| {
-            if (col.next_index >= col.current_array.length and !try col.get_next_array()) {
-                for (columns_slice[i_col + 1 .. columns_slice.len]) |*col_| {
-                    if (i_col != 0 or try col_.get_next_array()) {
-                        return raise(.Exception, "Arrays don't have equal length");
+    {
+        var file = std.fs.createFileAbsolute(args.path, .{}) catch {
+            return raise(.Exception, "Error opening file");
+        };
+        defer file.close();
+
+        var thread_state = py.PyEval_SaveThread();
+        defer if (thread_state) |t_state| py.PyEval_RestoreThread(t_state);
+
+        main_loop: while (true) {
+            for (columns_slice, 0..) |*col, i_col| {
+                if (col.next_index >= col.current_array.length) {
+                    py.PyEval_RestoreThread(thread_state orelse unreachable);
+                    thread_state = null;
+
+                    if (!try col.get_next_array()) {
+                        for (columns_slice[i_col + 1 .. columns_slice.len]) |*col_| {
+                            if (i_col != 0 or try col_.get_next_array()) {
+                                return raise(.Exception, "Arrays don't have equal length");
+                            }
+                        }
+                        break :main_loop;
                     }
+
+                    thread_state = py.PyEval_SaveThread();
                 }
-                break :main_loop;
+                col.bcp_info.writer(col, &file) catch unreachable;
+                col.next_index += 1;
             }
-            col.bcp_info.writer(col, &file) catch unreachable;
-            col.next_index += 1;
         }
     }
-
     const format_list = py.PyList_New(0) orelse return Err.PyError;
     errdefer py.Py_DECREF(format_list);
     for (columns_slice) |*col| {
@@ -989,16 +1001,19 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
         print("col {any}\n", .{arr_ptr.*});
     }
 
-    main_loop: for (0..args.rows_max) |i_row| {
-        for (arrays, state.columns, 0..) |arr, *st, i_col| {
-            print("i_col {}\n", .{i_col});
-            st.read_cell(i_row, st, arr) catch |err| switch (err) {
-                ReadError.EOF_expected => if (i_col != 0) return ReadError.EOF_unexpected else break :main_loop,
-                else => {
-                    print("{any}\n", .{err});
-                    unreachable;
-                },
-            };
+    {
+        const thread_state = py.PyEval_SaveThread() orelse unreachable;
+        defer py.PyEval_RestoreThread(thread_state);
+
+        main_loop: for (0..args.rows_max) |i_row| {
+            for (arrays, state.columns, 0..) |arr, *st, i_col| {
+                st.read_cell(i_row, st, arr) catch |err| switch (err) {
+                    ReadError.EOF_expected => if (i_col != 0) return ReadError.EOF_unexpected else break :main_loop,
+                    else => {
+                        unreachable;
+                    },
+                };
+            }
         }
     }
 
