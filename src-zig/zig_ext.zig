@@ -279,6 +279,7 @@ const BcpInfo = struct {
     decimal_precision: u8 = 0,
     timestamp_timezone_offset: i16 = 0,
     timestamp_factor_ns: i64 = 0,
+    bytes_fixed_size: usize = 0,
 
     fn init(
         format: formats,
@@ -332,6 +333,16 @@ const BcpInfo = struct {
                 if (iter.next() != null) {
                     return raise(.NotImplemented, "Non 128 bit decimals are not supported");
                 }
+                return bcp_info;
+            }
+            if (fmt[0] == 'w') {
+                var bcp_info = try BcpInfo.init(.bytes_fixed, "SQLBINARY");
+                if (fmt[1] != ':') {
+                    return raise_args(.TypeError, "Expecting ':' as second character of fixed binary format string '{s}'", .{fmt});
+                }
+                bcp_info.bytes_fixed_size = std.fmt.parseInt(u8, fmt[2..], 10) catch {
+                    return raise_args(.TypeError, "Could not parse length of fixed binary format '{s}'", .{fmt});
+                };
                 return bcp_info;
             }
             if (std.mem.eql(u8, fmt, "tdD")) {
@@ -471,6 +482,7 @@ const formats = enum(i64) {
     timestamp,
     timestamp_timezone,
     null,
+    bytes_fixed,
 };
 
 inline fn format_types(comptime format: formats) struct { prefix: type, arrow: type, bcp: type } {
@@ -488,6 +500,7 @@ inline fn format_types(comptime format: formats) struct { prefix: type, arrow: t
         inline formats.float32 => .{ i8, f32, f32 },
         inline formats.float64 => .{ i8, f64, f64 },
         inline formats.bytes => .{ i64, u32, u32 },
+        inline formats.bytes_fixed => .{ i64, i0, i0 },
         inline formats.decimal => .{ i8, i128, Decimal },
         inline formats.date => .{ i8, i32, u24 },
         inline formats.datetime => .{ i8, i64, DateTime64 },
@@ -537,12 +550,15 @@ const WriteError = error{ write_error, missing_buffer, int_cast };
 inline fn write_cell(self: *Column, file: *std.fs.File, comptime format: formats) WriteError!void {
     const types = format_types(format);
     const types_size = comptime format_sizes.get(format);
-    const main_buffer = if (comptime format != .null)
-        try self.main_buffer(types.arrow)
-    else
-        undefined;
+    const main_buffer = switch (format) {
+        inline .null => undefined,
+        // bytes_fixed doesn't quite fit with the others, since the cell size is runtime known only.
+        inline .bytes_fixed => try self.main_buffer(u8),
+        inline else => try self.main_buffer(types.arrow),
+    };
     const bytes_bcp: usize = switch (format) {
         inline .bytes => main_buffer[self.next_index + 1] - main_buffer[self.next_index],
+        inline .bytes_fixed => self.bcp_info.bytes_fixed_size,
         inline else => types_size.bcp,
     };
 
@@ -564,9 +580,11 @@ inline fn write_cell(self: *Column, file: *std.fs.File, comptime format: formats
         return;
     }
 
-    if (format == .bytes) {
+    if (comptime format == .bytes) {
         const data_buffer = try self.data_buffer();
         _ = file.write(data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]) catch return WriteError.write_error;
+    } else if (comptime format == .bytes_fixed) {
+        _ = file.write(main_buffer[self.next_index * bytes_bcp .. (self.next_index + 1) * bytes_bcp]) catch return WriteError.write_error;
     } else {
         const val_arrow = if (format == .boolean)
             bit_get(main_buffer, self.next_index)
@@ -790,7 +808,7 @@ fn write_arrow(py_args: ?*PyObject) !?*PyObject {
         const item = try zig_to_py(.{
             col.bcp_info.dtype_name,
             sizes.prefix,
-            if (col.bcp_info.format == .bytes) 0 else sizes.bcp,
+            if (col.bcp_info.format == .bytes or col.bcp_info.format == .bytes_fixed) 0 else sizes.bcp,
         });
         defer py.Py_DECREF(item);
         if (py.PyList_Append(format_list, item) == -1) {
