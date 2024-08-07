@@ -278,7 +278,7 @@ const BcpInfo = struct {
     decimal_size: u8 = 0,
     decimal_precision: u8 = 0,
     timestamp_timezone_offset: i16 = 0,
-    timestamp_factor_ns: i64 = 0,
+    time_factor_ns: i64 = 0,
     bytes_fixed_size: usize = 0,
 
     fn init(
@@ -349,7 +349,9 @@ const BcpInfo = struct {
                 return try BcpInfo.init(.date, "SQLDATE");
             }
             if (std.mem.eql(u8, fmt, "tdm")) {
-                return try BcpInfo.init(.datetime, "SQLDATETIME2");
+                var bcp_info = try BcpInfo.init(.timestamp, "SQLDATETIME2");
+                bcp_info.time_factor_ns = 1000 * 1000;
+                return bcp_info;
             }
             if (std.mem.eql(u8, fmt[0..2], "ts")) {
                 if (fmt[3] != ':') {
@@ -367,11 +369,11 @@ const BcpInfo = struct {
                 };
                 if (timezone.len == 0) {
                     var bcp_info = try BcpInfo.init(.timestamp, "SQLDATETIME2");
-                    bcp_info.timestamp_factor_ns = factor_ns;
+                    bcp_info.time_factor_ns = factor_ns;
                     return bcp_info;
                 } else {
                     var bcp_info = try BcpInfo.init(.timestamp_timezone, "SQLDATETIMEOFFSET");
-                    bcp_info.timestamp_factor_ns = factor_ns;
+                    bcp_info.time_factor_ns = factor_ns;
                     const sign: i16 = switch (timezone[0]) {
                         '+' => 1,
                         '-' => -1,
@@ -391,6 +393,31 @@ const BcpInfo = struct {
                     }
                     bcp_info.timestamp_timezone_offset = sign * (hours * 60 + minutes);
                     return bcp_info;
+                }
+            }
+            if (fmt.len == 3 and fmt[0] == 't' and fmt[1] == 't') {
+                switch (fmt[2]) {
+                    's' => {
+                        var bcp_info = try BcpInfo.init(.time32, "SQLTIME");
+                        bcp_info.time_factor_ns = 1000 * 1000 * 1000;
+                        return bcp_info;
+                    },
+                    'm' => {
+                        var bcp_info = try BcpInfo.init(.time32, "SQLTIME");
+                        bcp_info.time_factor_ns = 1000 * 1000;
+                        return bcp_info;
+                    },
+                    'u' => {
+                        var bcp_info = try BcpInfo.init(.time64, "SQLTIME");
+                        bcp_info.time_factor_ns = 1000;
+                        return bcp_info;
+                    },
+                    'n' => {
+                        var bcp_info = try BcpInfo.init(.time64, "SQLTIME");
+                        bcp_info.time_factor_ns = 1;
+                        return bcp_info;
+                    },
+                    else => {},
                 }
             }
             return raise_args(.NotImplemented, "Format '{s}' not implemented", .{fmt});
@@ -478,7 +505,8 @@ const formats = enum(i64) {
     bytes,
     decimal,
     date,
-    datetime,
+    time32,
+    time64,
     timestamp,
     timestamp_timezone,
     null,
@@ -503,7 +531,8 @@ inline fn format_types(comptime format: formats) struct { prefix: type, arrow: t
         inline formats.bytes_fixed => .{ i64, i0, i0 },
         inline formats.decimal => .{ i8, i128, Decimal },
         inline formats.date => .{ i8, i32, u24 },
-        inline formats.datetime => .{ i8, i64, DateTime64 },
+        inline formats.time32 => .{ i8, i32, u40 },
+        inline formats.time64 => .{ i8, i64, u40 },
         inline formats.timestamp => .{ i8, i64, DateTime64 },
         inline formats.timestamp_timezone => .{ i8, i64, DateTimeOffset },
         inline formats.null => .{ i8, i0, i0 },
@@ -598,9 +627,10 @@ inline fn write_cell(self: *Column, file: *std.fs.File, comptime format: formats
                 .int_data = if (val_arrow >= 0) val_arrow else -val_arrow,
             },
             inline .date => try DateTime64.date_arrow_to_bcp(val_arrow),
-            inline .datetime => try DateTime64.from_ns_factor(val_arrow, 1000 * 1000),
-            inline .timestamp => try DateTime64.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns),
-            inline .timestamp_timezone => try DateTimeOffset.from_ns_factor(val_arrow, self.bcp_info.timestamp_factor_ns, self.bcp_info.timestamp_timezone_offset),
+            inline .time32 => std.math.cast(types.bcp, @divTrunc(@as(i64, val_arrow) * self.bcp_info.time_factor_ns, 100)) orelse return WriteError.int_cast,
+            inline .time64 => std.math.cast(types.bcp, @divTrunc(val_arrow * self.bcp_info.time_factor_ns, 100)) orelse return WriteError.int_cast,
+            inline .timestamp => try DateTime64.from_ns_factor(val_arrow, self.bcp_info.time_factor_ns),
+            inline .timestamp_timezone => try DateTimeOffset.from_ns_factor(val_arrow, self.bcp_info.time_factor_ns, self.bcp_info.timestamp_timezone_offset),
             inline .boolean => blk: {
                 const val: types.bcp = @intFromBool(val_arrow);
                 break :blk val;
@@ -836,6 +866,7 @@ const formats_sql = enum(u8) {
     real,
     decimal,
     date,
+    time,
     datetime2,
     datetimeoffset,
     uniqueidentifier,
@@ -863,6 +894,7 @@ const format_info_sql = blk: {
             formats_sql.real => .{ i8, f64, f64, "g", "SQLFLT8" },
             formats_sql.decimal => .{ i8, Decimal, i128, "n", "SQLDECIMAL" },
             formats_sql.date => .{ i8, u24, i32, "tdD", "SQLDATE" },
+            formats_sql.time => .{ i8, u40, i64, "ttn", "SQLTIME" },
             formats_sql.datetime2 => .{ i8, DateTime64, i64, "tsn:", "SQLDATETIME2" },
             formats_sql.datetimeoffset => .{ i8, DateTimeOffset, i64, "n", "SQLDATETIMEOFFSET" },
             formats_sql.uniqueidentifier => .{ i8, [16]u8, [16]u8, "w:16", "SQLUNIQUEID" },
@@ -1138,6 +1170,7 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
             break :blk val;
         },
         inline .date => DateTime64.date_bcp_to_arrow(bcp_value),
+        inline .time => @as(types.arrow, bcp_value) * 100,
         inline .datetime2 => bcp_value.to_ns(),
         inline .datetimeoffset => blk: {
             try state.validate_timezone(bcp_value.offset);
