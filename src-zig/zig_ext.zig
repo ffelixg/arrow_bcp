@@ -95,6 +95,7 @@ const StateContainer = struct {
     arena: std.heap.ArenaAllocator,
     columns: []ReaderState,
     file: std.fs.File,
+    reader: std.io.BufferedReader(4096, std.fs.File.Reader),
     release: ?*fn (*StateContainer) void = @constCast(&release_state),
 };
 
@@ -121,7 +122,7 @@ const ReaderState = struct {
             inline else => comptime unreachable,
         };
 
-        const bytes_read = self.parent.file.read(target_as_bytes) catch return ReadError.file_error;
+        const bytes_read = self.parent.reader.read(target_as_bytes) catch return ReadError.file_error;
 
         if (bytes_read == target_as_bytes.len) {
             return true;
@@ -576,7 +577,7 @@ inline fn bit_set(ptr: anytype, index: anytype, comptime value: bool) void {
 }
 
 const WriteError = error{ write_error, missing_buffer, int_cast };
-inline fn write_cell(self: *Column, file: *std.fs.File, comptime format: formats) WriteError!void {
+inline fn write_cell(self: *Column, writer: *buffered_writer_type, comptime format: formats) WriteError!void {
     const types = format_types(format);
     const types_size = comptime format_sizes.get(format);
     const main_buffer = switch (format) {
@@ -599,7 +600,7 @@ inline fn write_cell(self: *Column, file: *std.fs.File, comptime format: formats
         } else break :blk false;
     };
 
-    _ = file.write(blk: {
+    _ = writer.write(blk: {
         const val: types.prefix = if (is_null) -1 else @intCast(bytes_bcp);
         const bytes: [*]u8 = @constCast(@ptrCast(&val));
         break :blk bytes[0..types_size.prefix];
@@ -611,9 +612,9 @@ inline fn write_cell(self: *Column, file: *std.fs.File, comptime format: formats
 
     if (comptime format == .bytes) {
         const data_buffer = try self.data_buffer();
-        _ = file.write(data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]) catch return WriteError.write_error;
+        _ = writer.write(data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]) catch return WriteError.write_error;
     } else if (comptime format == .bytes_fixed) {
-        _ = file.write(main_buffer[self.next_index * bytes_bcp .. (self.next_index + 1) * bytes_bcp]) catch return WriteError.write_error;
+        _ = writer.write(main_buffer[self.next_index * bytes_bcp .. (self.next_index + 1) * bytes_bcp]) catch return WriteError.write_error;
     } else {
         const val_arrow = if (format == .boolean)
             bit_get(main_buffer, self.next_index)
@@ -643,21 +644,22 @@ inline fn write_cell(self: *Column, file: *std.fs.File, comptime format: formats
             },
             inline else => @as(types.bcp, val_arrow),
         };
-        _ = file.write(blk: {
+        _ = writer.write(blk: {
             const bytes: [*]u8 = @constCast(@ptrCast(&val_bcp));
             break :blk bytes[0..bytes_bcp];
         }) catch return WriteError.write_error;
     }
 }
 
-const writer_type = *fn (*Column, *std.fs.File) @typeInfo(@TypeOf(write_cell)).Fn.return_type.?;
+const buffered_writer_type = std.io.BufferedWriter(4096, std.fs.File.Writer);
+const writer_type = *fn (*Column, *buffered_writer_type) @typeInfo(@TypeOf(write_cell)).Fn.return_type.?;
 
 const writers = blk: {
     var arr = std.EnumArray(formats, writer_type).initUndefined();
     for (std.enums.values(formats)) |fmt| {
         const dummy = struct {
-            fn write_fmt(self: *Column, file: *std.fs.File) !void {
-                try write_cell(self, file, fmt);
+            fn write_fmt(self: *Column, writer: *buffered_writer_type) !void {
+                try write_cell(self, writer, fmt);
             }
         };
         arr.set(fmt, @constCast(&dummy.write_fmt));
@@ -806,6 +808,8 @@ fn write_arrow(py_args: ?*PyObject) !?*PyObject {
         };
         defer file.close();
 
+        var writer = buffered_writer_type{ .unbuffered_writer = file.writer() };
+
         var thread_state = py.PyEval_SaveThread();
         defer if (thread_state) |t_state| py.PyEval_RestoreThread(t_state);
 
@@ -826,10 +830,12 @@ fn write_arrow(py_args: ?*PyObject) !?*PyObject {
 
                     thread_state = py.PyEval_SaveThread();
                 }
-                col.bcp_info.writer(col, &file) catch unreachable;
+                col.bcp_info.writer(col, &writer) catch unreachable;
                 col.next_index += 1;
             }
         }
+
+        writer.flush() catch return WriteError.write_error;
     }
     const format_list = py.PyList_New(0) orelse return Err.PyError;
     errdefer py.Py_DECREF(format_list);
@@ -964,6 +970,7 @@ fn init_reader(py_args: ?*PyObject) !*PyObject {
         .arena = arena,
         .columns = states,
         .file = file,
+        .reader = .{ .unbuffered_reader = file.reader() },
     };
 
     const schema_capsules = py.PyTuple_New(@intCast(nr_columns)) orelse return Err.PyError;
