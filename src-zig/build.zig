@@ -1,5 +1,5 @@
 const std = @import("std");
-const include_paths = @import("include_dirs.zig");
+const paths = @import("include_dirs.zig");
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -26,8 +26,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lib.linkLibC();
-    inline for (include_paths.paths) |path| {
+    inline for (paths.include) |path| {
         lib.addIncludePath(.{ .cwd_relative = path });
+    }
+    inline for (paths.lib) |path| {
+        lib.addLibraryPath(.{ .cwd_relative = path });
+    }
+    if (target.query.os_tag == .windows) {
+        lib.linkSystemLibrary2("python3", .{ .needed = true, .preferred_link_mode = .static });
     }
     lib.linker_allow_shlib_undefined = true;
 

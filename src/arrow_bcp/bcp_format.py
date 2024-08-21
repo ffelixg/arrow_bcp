@@ -32,7 +32,7 @@ def load(format_bytes: bytes) -> list[bcpColumn]:
         ]
         assert int(parts[0].decode().strip()) == i_line + 1
         assert int(parts[5].decode().strip()) == i_line + 1
-        col_args = [i.strip().decode() for i in [parts[1], parts[2], parts[3], parts[6], parts[7]]]
+        col_args = [i.strip().decode(errors="ignore") for i in [parts[1], parts[2], parts[3], parts[6], parts[7]]]
         col_args[1] = int(col_args[1])
         col_args[2] = int(col_args[2])
         columns.append(bcpColumn(*col_args))
