@@ -27,25 +27,25 @@ const DateTime64 = packed struct {
     date: u24,
 
     inline fn from_ns_factor(val: i64, ns_factor: i64) !DateTime64 {
-        const as_ns = val * ns_factor;
-        const ns_in_day = 1000 * 1000 * 1000 * 60 * 60 * 24;
+        const as_bcp_time = @divFloor(std.math.mulWide(i64, val, ns_factor), 100);
+        const time_in_day = 10 * 1000 * 1000 * 60 * 60 * 24;
         return DateTime64{
-            .date = try DateTime64.date_arrow_to_bcp(@divFloor(as_ns, ns_in_day)),
-            .time = @intCast(@divFloor(@mod(as_ns, ns_in_day), 100)),
+            .date = try DateTime64.date_arrow_to_bcp(@divFloor(as_bcp_time, time_in_day)),
+            .time = @intCast(@mod(as_bcp_time, time_in_day)),
         };
     }
 
     inline fn date_arrow_to_bcp(val_arrow: anytype) !u24 {
-        return std.math.cast(u24, val_arrow + 719162) orelse return WriteError.int_cast;
+        return std.math.cast(u24, val_arrow + 719162) orelse return WriteError.InvalidDate;
     }
 
     inline fn date_bcp_to_arrow(val_bcp: u24) i32 {
-        return val_bcp - 719162;
+        return @as(i32, val_bcp) - 719162;
     }
 
-    inline fn to_ns(self: DateTime64) i64 {
-        const ns_in_day = 1000 * 1000 * 1000 * 60 * 60 * 24;
-        return @as(i64, date_bcp_to_arrow(self.date)) * ns_in_day + @as(i64, self.time) * 100;
+    inline fn to_us(self: DateTime64) i64 {
+        const us_in_day = 1000 * 1000 * 60 * 60 * 24;
+        return @as(i64, date_bcp_to_arrow(self.date)) * us_in_day + @as(i64, @divFloor(self.time, 10));
     }
 };
 
@@ -122,7 +122,7 @@ const ReaderState = struct {
             inline else => comptime unreachable,
         };
 
-        const bytes_read = self.parent.reader.read(target_as_bytes) catch return ReadError.file_error;
+        const bytes_read = self.parent.reader.read(target_as_bytes) catch return ReadError.ReaderError;
 
         if (bytes_read == target_as_bytes.len) {
             return true;
@@ -144,7 +144,7 @@ const ReaderState = struct {
                 self.parent.arena.allocator(),
                 "d:{},{}",
                 .{ size, precision },
-            ) catch return ReadError.no_memory;
+            ) catch return ReadError.OutOfMemory;
         }
     }
 
@@ -164,9 +164,9 @@ const ReaderState = struct {
             const minutes: i16 = @mod(offset, 60);
             self.schema_format = std.fmt.allocPrintZ(
                 self.parent.arena.allocator(),
-                "tsn:{c}{}:{}",
+                "tsu:{c}{}:{}",
                 .{ sign, hours, minutes },
-            ) catch return ReadError.no_memory;
+            ) catch return ReadError.OutOfMemory;
         }
     }
 
@@ -242,7 +242,7 @@ fn to_capsule(c_data: anytype) !*PyObject {
 
 const ArrowError = error{MissingBuffer};
 const Err = error{PyError};
-const Exceptions = enum { Exception, NotImplemented, TypeError, ValueError };
+const Exceptions = enum { Exception, NotImplemented, TypeError, ValueError, IOError, EOFError };
 
 fn raise_args(exc: Exceptions, comptime msg: []const u8, args: anytype) Err {
     @setCold(true);
@@ -251,6 +251,8 @@ fn raise_args(exc: Exceptions, comptime msg: []const u8, args: anytype) Err {
         .NotImplemented => py.PyExc_NotImplementedError,
         .TypeError => py.PyExc_TypeError,
         .ValueError => py.PyExc_ValueError,
+        .IOError => py.PyExc_IOError,
+        .EOFError => py.PyExc_EOFError,
     };
     const formatted = std.fmt.allocPrintZ(allocator, msg, args) catch "Error formatting error message";
     defer allocator.free(formatted);
@@ -325,12 +327,16 @@ const BcpInfo = struct {
                     return raise_args(.TypeError, "Expecting ':' as second character of decimal format string '{s}'", .{fmt});
                 }
                 var iter = std.mem.tokenizeScalar(u8, fmt[2..], ',');
-                bcp_info.decimal_size = try std.fmt.parseInt(u8, iter.next() orelse {
+                bcp_info.decimal_size = std.fmt.parseInt(u8, iter.next() orelse {
                     return raise_args(.TypeError, "Incomplete decimal format string '{s}'", .{fmt});
-                }, 10);
-                bcp_info.decimal_precision = try std.fmt.parseInt(u8, iter.next() orelse {
+                }, 10) catch {
+                    return raise_args(.TypeError, "Error parsing decimal size for format string '{s}'", .{fmt});
+                };
+                bcp_info.decimal_precision = std.fmt.parseInt(u8, iter.next() orelse {
                     return raise_args(.TypeError, "Incomplete decimal format string '{s}'", .{fmt});
-                }, 10);
+                }, 10) catch {
+                    return raise_args(.TypeError, "Error parsing decimal precision for format string '{s}'", .{fmt});
+                };
                 if (iter.next() != null) {
                     return raise(.NotImplemented, "Non 128 bit decimals are not supported");
                 }
@@ -383,12 +389,16 @@ const BcpInfo = struct {
                         },
                     };
                     var iter = std.mem.tokenizeScalar(u8, timezone[1..], ':');
-                    const hours = try std.fmt.parseInt(i16, iter.next() orelse {
+                    const hours = std.fmt.parseInt(i16, iter.next() orelse {
+                        return raise_args(.TypeError, "Incomplete timezone format string '{s}'", .{fmt});
+                    }, 10) catch {
                         return raise_args(.TypeError, "Error parsing timezone hour for format string '{s}'", .{fmt});
-                    }, 10);
-                    const minutes = try std.fmt.parseInt(i16, iter.next() orelse {
+                    };
+                    const minutes = std.fmt.parseInt(i16, iter.next() orelse {
+                        return raise_args(.TypeError, "Incomplete timezone format string '{s}'", .{fmt});
+                    }, 10) catch {
                         return raise_args(.TypeError, "Error parsing timezone minute for format string '{s}'", .{fmt});
-                    }, 10);
+                    };
                     if (iter.next() != null) {
                         return raise_args(.TypeError, "Invalid timestamp format string '{s}'", .{fmt});
                     }
@@ -470,23 +480,29 @@ const Column = struct {
 
     inline fn valid_buffer(self: *Column) ?[*]bool {
         if (self.current_array.buffers) |buf| {
-            return @alignCast(@ptrCast(buf[0]));
+            if (self.current_array.n_buffers > 0) {
+                return @alignCast(@ptrCast(buf[0]));
+            }
         }
         return null;
     }
 
     inline fn main_buffer(self: *Column, tp: type) ![*]tp {
         if (self.current_array.buffers) |buf| {
-            return @alignCast(@ptrCast(buf[1] orelse return WriteError.missing_buffer));
+            if (self.current_array.n_buffers > 1) {
+                return @alignCast(@ptrCast(buf[1] orelse return WriteError.MissingBuffer));
+            }
         }
-        return WriteError.missing_buffer;
+        return WriteError.MissingBuffer;
     }
 
     inline fn data_buffer(self: *Column) ![*]u8 {
         if (self.current_array.buffers) |buf| {
-            return @alignCast(@ptrCast(buf[2] orelse return WriteError.missing_buffer));
+            if (self.current_array.n_buffers > 2) {
+                return @alignCast(@ptrCast(buf[2] orelse return WriteError.MissingBuffer));
+            }
         }
-        return WriteError.missing_buffer;
+        return WriteError.MissingBuffer;
     }
 };
 
@@ -576,7 +592,7 @@ inline fn bit_set(ptr: anytype, index: anytype, comptime value: bool) void {
     }
 }
 
-const WriteError = error{ write_error, missing_buffer, int_cast };
+const WriteError = error{ WriterError, MissingBuffer, InvalidDate, InvalidTime };
 inline fn write_cell(self: *Column, writer: *buffered_writer_type, comptime format: formats) WriteError!void {
     const types = format_types(format);
     const types_size = comptime format_sizes.get(format);
@@ -604,7 +620,7 @@ inline fn write_cell(self: *Column, writer: *buffered_writer_type, comptime form
         const val: types.prefix = if (is_null) -1 else @intCast(bytes_bcp);
         const bytes: [*]u8 = @constCast(@ptrCast(&val));
         break :blk bytes[0..types_size.prefix];
-    }) catch return WriteError.write_error;
+    }) catch return WriteError.WriterError;
 
     if (is_null) {
         return;
@@ -612,9 +628,9 @@ inline fn write_cell(self: *Column, writer: *buffered_writer_type, comptime form
 
     if (comptime format == .bytes) {
         const data_buffer = try self.data_buffer();
-        _ = writer.write(data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]) catch return WriteError.write_error;
+        _ = writer.write(data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]) catch return WriteError.WriterError;
     } else if (comptime format == .bytes_fixed) {
-        _ = writer.write(main_buffer[self.next_index * bytes_bcp .. (self.next_index + 1) * bytes_bcp]) catch return WriteError.write_error;
+        _ = writer.write(main_buffer[self.next_index * bytes_bcp .. (self.next_index + 1) * bytes_bcp]) catch return WriteError.WriterError;
     } else {
         const val_arrow = if (format == .boolean)
             bit_get(main_buffer, self.next_index)
@@ -628,8 +644,8 @@ inline fn write_cell(self: *Column, writer: *buffered_writer_type, comptime form
                 .int_data = if (val_arrow >= 0) val_arrow else -val_arrow,
             },
             inline .date => try DateTime64.date_arrow_to_bcp(val_arrow),
-            inline .time32 => std.math.cast(types.bcp, @divTrunc(@as(i64, val_arrow) * self.bcp_info.time_factor_ns, 100)) orelse return WriteError.int_cast,
-            inline .time64 => std.math.cast(types.bcp, @divTrunc(val_arrow * self.bcp_info.time_factor_ns, 100)) orelse return WriteError.int_cast,
+            inline .time32 => std.math.cast(types.bcp, @divTrunc(@as(i64, val_arrow) * self.bcp_info.time_factor_ns, 100)) orelse return WriteError.InvalidTime,
+            inline .time64 => std.math.cast(types.bcp, @divTrunc(val_arrow * self.bcp_info.time_factor_ns, 100)) orelse return WriteError.InvalidTime,
             inline .timestamp => try DateTime64.from_ns_factor(val_arrow, self.bcp_info.time_factor_ns),
             inline .timestamp_timezone => try DateTimeOffset.from_ns_factor(val_arrow, self.bcp_info.time_factor_ns, self.bcp_info.timestamp_timezone_offset),
             inline .boolean => blk: {
@@ -647,7 +663,7 @@ inline fn write_cell(self: *Column, writer: *buffered_writer_type, comptime form
         _ = writer.write(blk: {
             const bytes: [*]u8 = @constCast(@ptrCast(&val_bcp));
             break :blk bytes[0..bytes_bcp];
-        }) catch return WriteError.write_error;
+        }) catch return WriteError.WriterError;
     }
 }
 
@@ -804,7 +820,7 @@ fn write_arrow(py_args: ?*PyObject) !?*PyObject {
     }
     {
         var file = std.fs.createFileAbsolute(args.path, .{}) catch {
-            return raise(.Exception, "Error opening file");
+            return raise(.IOError, "Error opening file");
         };
         defer file.close();
 
@@ -813,8 +829,8 @@ fn write_arrow(py_args: ?*PyObject) !?*PyObject {
         var thread_state = py.PyEval_SaveThread();
         defer if (thread_state) |t_state| py.PyEval_RestoreThread(t_state);
 
-        main_loop: while (true) {
-            for (columns_slice, 0..) |*col, i_col| {
+        main_loop: for (0..std.math.maxInt(usize)) |i_row| {
+            blk: for (columns_slice, 0..) |*col, i_col| {
                 if (col.next_index >= col.current_array.length) {
                     py.PyEval_RestoreThread(thread_state orelse unreachable);
                     thread_state = null;
@@ -829,13 +845,27 @@ fn write_arrow(py_args: ?*PyObject) !?*PyObject {
                     }
 
                     thread_state = py.PyEval_SaveThread();
+                    if (col.current_array.length == 0) {
+                        col.next_index += 1;
+                        continue :blk;
+                    }
                 }
-                col.bcp_info.writer(col, &writer) catch unreachable;
+                col.bcp_info.writer(col, &writer) catch |err| {
+                    py.PyEval_RestoreThread(thread_state orelse unreachable);
+                    thread_state = null;
+
+                    return switch (err) {
+                        WriteError.WriterError => raise_args(.IOError, "Error writing to file for row index {} and column index {}", .{ i_row, i_col }),
+                        WriteError.MissingBuffer => raise_args(.TypeError, "Arrow column was missing a buffer for row index {} and column index {}", .{ i_row, i_col }),
+                        WriteError.InvalidDate => raise_args(.ValueError, "Error converting date part at row index {} and column index {}", .{ i_row, i_col }),
+                        WriteError.InvalidTime => raise_args(.ValueError, "Error converting time at row index {} and column index {}", .{ i_row, i_col }),
+                    };
+                };
                 col.next_index += 1;
             }
         }
 
-        writer.flush() catch return WriteError.write_error;
+        writer.flush() catch return raise(.IOError, "Error flushing to file");
     }
     const format_list = py.PyList_New(0) orelse return Err.PyError;
     errdefer py.Py_DECREF(format_list);
@@ -858,7 +888,7 @@ fn ext_write_arrow(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject
     _ = module;
     return write_arrow(args) catch |err| switch (err) {
         Err.PyError => return null,
-        else => unreachable,
+        error.OutOfMemory => return py.PyErr_NoMemory(),
     };
 }
 
@@ -901,7 +931,9 @@ const format_info_sql = blk: {
             formats_sql.decimal => .{ i8, Decimal, i128, "n", "SQLDECIMAL" },
             formats_sql.date => .{ i8, u24, i32, "tdD", "SQLDATE" },
             formats_sql.time => .{ i8, u40, i64, "ttn", "SQLTIME" },
-            formats_sql.datetime2 => .{ i8, DateTime64, i64, "tsn:", "SQLDATETIME2" },
+            // When reading SQLDATETIME2, there is a choice between losing precision (converting to tsu)
+            // and not covering the whole spectrum (converting to tsn). Maybe this should be configurable
+            formats_sql.datetime2 => .{ i8, DateTime64, i64, "tsu:", "SQLDATETIME2" },
             formats_sql.datetimeoffset => .{ i8, DateTimeOffset, i64, "n", "SQLDATETIMEOFFSET" },
             formats_sql.uniqueidentifier => .{ i8, [16]u8, [16]u8, "w:16", "SQLUNIQUEID" },
             formats_sql.char => .{ i64, u0, u32, "u", "SQLCHAR" },
@@ -1013,7 +1045,7 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
         struct { state_capsule: *PyObject, rows_max: u32 },
         py_args orelse return raise(.Exception, "No arguments passed"),
     );
-    const rows_max_rounded: u32 = 512 * try std.math.divCeil(u32, args.rows_max + 1, 512);
+    const rows_max_rounded: u32 = 512 * (std.math.divCeil(u32, args.rows_max + 1, 512) catch unreachable);
     defer py.Py_DECREF(args.state_capsule);
     const state: *StateContainer = from_capsule(StateContainer, args.state_capsule).?;
 
@@ -1071,16 +1103,26 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
     }
 
     {
-        const thread_state = py.PyEval_SaveThread() orelse unreachable;
-        defer py.PyEval_RestoreThread(thread_state);
+        var thread_state = py.PyEval_SaveThread();
+        defer if (thread_state) |s| py.PyEval_RestoreThread(s);
 
         main_loop: for (0..args.rows_max) |i_row| {
             for (arrays, state.columns, 0..) |arr, *st, i_col| {
-                st.read_cell(i_row, st, arr) catch |err| switch (err) {
-                    ReadError.EOF_expected => if (i_col != 0) return ReadError.EOF_unexpected else break :main_loop,
-                    else => {
-                        unreachable;
-                    },
+                st.read_cell(i_row, st, arr) catch |err| {
+                    if (err == ReadError.EOF_expected and i_col == 0) {
+                        break :main_loop;
+                    }
+                    py.PyEval_RestoreThread(thread_state orelse unreachable);
+                    thread_state = null;
+                    return switch (err) {
+                        ReadError.DecimalChanged => raise_args(.ValueError, "Decimal format changed at row index {} and column index {}", .{ i_row, i_col }),
+                        ReadError.TimezoneChanged => raise_args(.ValueError, "Timezone changed for row index {} and column index {}", .{ i_row, i_col }),
+                        ReadError.EOF_unexpected, ReadError.EOF_expected => raise_args(.EOFError, "Unexpected end of file at row index {} and column index {}", .{ i_row, i_col }),
+                        ReadError.ReaderError => raise_args(.IOError, "Error reading file at row index {} and column index {}", .{ i_row, i_col }),
+                        ReadError.DecimalSign => raise_args(.ValueError, "Invalid decimal sign at row index {} and column index {}", .{ i_row, i_col }),
+                        ReadError.NegativeCharLen => raise_args(.ValueError, "Negative string length indicator at row index {} and column index {}", .{ i_row, i_col }),
+                        ReadError.OutOfMemory => error.OutOfMemory,
+                    };
                 };
             }
         }
@@ -1112,7 +1154,7 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
     return capsule_tuple;
 }
 
-const ReadError = error{ DecimalChanged, TimezoneChanged, EOF_unexpected, EOF_expected, file_error, malformed_value, no_memory };
+const ReadError = error{ DecimalChanged, TimezoneChanged, EOF_unexpected, EOF_expected, ReaderError, DecimalSign, OutOfMemory, NegativeCharLen };
 
 inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptime format: formats_sql) !void {
     const types = format_info_sql.types.get(format);
@@ -1133,7 +1175,7 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
             arr.null_count += 1;
             return;
         }
-        const target_index = last_index + (std.math.cast(u32, prefix) orelse return ReadError.malformed_value);
+        const target_index = last_index + (std.math.cast(u32, prefix) orelse return ReadError.NegativeCharLen);
         main_buffer_ptr[i_row + 1] = target_index;
         if (target_index > arr.length_data_buffer) {
             // TODO realloc
@@ -1171,17 +1213,17 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
             const val = switch (bcp_value.sign) {
                 1 => @as(i128, 1),
                 0 => @as(i128, -1),
-                else => return ReadError.malformed_value,
+                else => return ReadError.DecimalSign,
             } * bcp_value.int_data;
             try state.validate_decimal(bcp_value.size, bcp_value.precision);
             break :blk val;
         },
         inline .date => DateTime64.date_bcp_to_arrow(bcp_value),
         inline .time => @as(types.arrow, bcp_value) * 100,
-        inline .datetime2 => bcp_value.to_ns(),
+        inline .datetime2 => bcp_value.to_us(),
         inline .datetimeoffset => blk: {
             try state.validate_timezone(bcp_value.offset);
-            break :blk (DateTime64{ .date = bcp_value.date, .time = bcp_value.time }).to_ns();
+            break :blk (DateTime64{ .date = bcp_value.date, .time = bcp_value.time }).to_us();
         },
         inline else => @as(types.arrow, bcp_value),
     };
@@ -1194,7 +1236,7 @@ fn ext_init_reader(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject
     _ = module;
     return init_reader(args) catch |err| switch (err) {
         Err.PyError => return null,
-        else => unreachable,
+        error.OutOfMemory => return py.PyErr_NoMemory(),
     };
 }
 
@@ -1202,7 +1244,7 @@ fn ext_read_batch(module: ?*PyObject, args: ?*PyObject) callconv(.C) ?*PyObject 
     _ = module;
     return read_batch(args) catch |err| switch (err) {
         Err.PyError => return null,
-        else => unreachable,
+        error.OutOfMemory => return py.PyErr_NoMemory(),
     };
 }
 

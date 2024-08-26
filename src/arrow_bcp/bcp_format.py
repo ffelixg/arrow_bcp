@@ -39,7 +39,8 @@ def load(format_bytes: bytes) -> list[bcpColumn]:
     return columns
 
 def dump(bcp_columns: list[bcpColumn]) -> bytes:
-    name_padding = max(len(i.column_name) for i in bcp_columns) + 16
+    # name_padding = max(len(i.column_name) for i in bcp_columns) + 16
+    name_padding = len(bcp_columns) + 16
     name_padding = int(name_padding // 4 * 4)
     just = [
         offsets[0],
@@ -59,7 +60,8 @@ def dump(bcp_columns: list[bcpColumn]) -> bytes:
                 str(col.bytes_data).encode().ljust(just[3]),
                 b'""'.ljust(just[4]),
                 str(i_col).encode().ljust(just[5]),
-                col.column_name.encode().ljust(just[6]),
+                # col.column_name.encode().ljust(just[6]),
+                (b"a"*(i_col+1)).ljust(just[6]),
                 # b"LATIN1_GENERAL_100_CI_AS_SC_UTF8" if col.type == "SQLCHAR" else b'""',
                 col.collation.encode(),
             ]
@@ -76,7 +78,8 @@ def native_to_implemented_types(bcp_columns: list[bcpColumn]) -> list[bcpColumn]
         new_bytes_data = col.bytes_data
         new_collation = collation_default
         match col.type:
-            case 'SQLBINARY':
+            case 'SQLBINARY' | 'SQLUDT':
+                new_type = 'SQLBINARY'
                 new_bytes_data = 0 # or varbinary(max)
                 new_bytes_indicator = 8
             case 'SQLCHAR' | 'SQLNCHAR' | 'SQLVARIANT':

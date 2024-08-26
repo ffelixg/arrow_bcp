@@ -35,7 +35,7 @@ class ZigBuilder(build_ext):
             "-m",
             "ziglang",
             "build",
-            *(["-Dtarget=x86_64-windows-msvc"] if windows else []),
+            *(["-Dtarget=x86_64-windows"] if windows else []),
         ], cwd=source)
 
         binary, = (p for p in Path("src-zig", "zig-out").glob(f"**/*{'.dll' if windows else ''}") if p.is_file())
