@@ -114,20 +114,19 @@ const ReaderState = struct {
         };
     }
 
-    inline fn read(self: *ReaderState, target_ptr: anytype) !bool {
-        const info = @typeInfo(@TypeOf(target_ptr)).Pointer;
-        const target_as_bytes = switch (info.size) {
-            inline .One => std.mem.asBytes(target_ptr)[0..@divExact(@bitSizeOf(info.child), 8)],
-            inline .Slice => target_ptr,
-            inline else => comptime unreachable,
-        };
+    inline fn readScalar(self: *ReaderState, T: type) !T {
+        var val: T = undefined;
+        try self.readSlice(std.mem.asBytes(&val)[0..@divExact(@bitSizeOf(T), 8)]);
+        return val;
+    }
 
+    inline fn readSlice(self: *ReaderState, target_as_bytes: []u8) !void {
         const bytes_read = self.parent.reader.read(target_as_bytes) catch return ReadError.ReaderError;
 
         if (bytes_read == target_as_bytes.len) {
-            return true;
+            return;
         } else if (bytes_read == 0) {
-            return false;
+            return ReadError.EOF_maybeok;
         } else {
             return ReadError.EOF_unexpected;
         }
@@ -203,6 +202,19 @@ const ArrowArray = extern struct {
     // Opaque producer-specific data, must be pointer sized
     // private_data: ?*anyopaque = null,
     length_data_buffer: usize,
+
+    fn fitDataBuffer(self: *ArrowArray, target_index: u32) !void {
+        const data_buffer_ptrptr = &(self.buffers.?[2].?);
+        if (target_index >= self.length_data_buffer) {
+            const new_len = @max(target_index + 1, self.length_data_buffer + self.length_data_buffer / 2);
+            data_buffer_ptrptr.* = std.c.realloc(data_buffer_ptrptr.*, new_len) orelse return ReadError.OutOfMemory;
+            self.length_data_buffer = new_len;
+        }
+    }
+
+    fn getDataBufferSafe(self: *ArrowArray) [*]u8 {
+        return @alignCast(@ptrCast(self.buffers.?[2].?));
+    }
 };
 
 fn capsule_name(T: type) [*c]const u8 {
@@ -451,7 +463,7 @@ const Column = struct {
         py.Py_DECREF(self._schema_capsule);
         py.Py_DECREF(self._chunk_generator);
         py.Py_XDECREF(self._current_array_capsule);
-        self.bcp_info.deinit(); // TODO ??
+        self.bcp_info.deinit();
     }
 
     fn get_next_array(self: *Column) !bool {
@@ -1117,7 +1129,10 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
                     return switch (err) {
                         ReadError.DecimalChanged => raise_args(.ValueError, "Decimal format changed at row index {} and column index {}", .{ i_row, i_col }),
                         ReadError.TimezoneChanged => raise_args(.ValueError, "Timezone changed for row index {} and column index {}", .{ i_row, i_col }),
-                        ReadError.EOF_unexpected, ReadError.EOF_expected => raise_args(.EOFError, "Unexpected end of file at row index {} and column index {}", .{ i_row, i_col }),
+                        ReadError.EOF_unexpected,
+                        ReadError.EOF_maybeok,
+                        ReadError.EOF_expected,
+                        => raise_args(.EOFError, "Unexpected end of file at row index {} and column index {}", .{ i_row, i_col }),
                         ReadError.ReaderError => raise_args(.IOError, "Error reading file at row index {} and column index {}", .{ i_row, i_col }),
                         ReadError.DecimalSign => raise_args(.ValueError, "Invalid decimal sign at row index {} and column index {}", .{ i_row, i_col }),
                         ReadError.NegativeCharLen => raise_args(.ValueError, "Negative string length indicator at row index {} and column index {}", .{ i_row, i_col }),
@@ -1154,19 +1169,18 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
     return capsule_tuple;
 }
 
-const ReadError = error{ DecimalChanged, TimezoneChanged, EOF_unexpected, EOF_expected, ReaderError, DecimalSign, OutOfMemory, NegativeCharLen };
+const ReadError = error{ DecimalChanged, TimezoneChanged, EOF_unexpected, EOF_maybeok, EOF_expected, ReaderError, DecimalSign, OutOfMemory, NegativeCharLen };
 
 inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptime format: formats_sql) !void {
     const types = format_info_sql.types.get(format);
-    var prefix: types.prefix = undefined;
-    if (!try state.read(&prefix)) {
-        return ReadError.EOF_expected;
-    }
+    const prefix = state.readScalar(types.prefix) catch |err| return switch (err) {
+        ReadError.EOF_maybeok => ReadError.EOF_expected,
+        else => err,
+    };
 
     arr.length += 1;
 
     if (comptime format == .binary or format == .char) {
-        const data_buffer_ptr: [*]u8 = @alignCast(@ptrCast(arr.buffers.?[2].?));
         const main_buffer_ptr: [*]u32 = @alignCast(@ptrCast(arr.buffers.?[1].?));
         const last_index = main_buffer_ptr[i_row];
         if (prefix == -1) {
@@ -1175,14 +1189,25 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
             arr.null_count += 1;
             return;
         }
-        const target_index = last_index + (std.math.cast(u32, prefix) orelse return ReadError.NegativeCharLen);
-        main_buffer_ptr[i_row + 1] = target_index;
-        if (target_index > arr.length_data_buffer) {
-            // TODO realloc
-            unreachable;
-        }
-        if (!try state.read(data_buffer_ptr[last_index..target_index])) {
-            return ReadError.EOF_unexpected;
+        if (prefix == -2) {
+            // this case seems to mostly occur when converting large utf-16 cells to utf-8
+            var current_start = last_index;
+            while (true) {
+                const prefix_minor = try state.readScalar(u32);
+                if (prefix_minor == 0) {
+                    break;
+                }
+                const current_end = prefix_minor + current_start;
+                try arr.fitDataBuffer(current_end);
+                try state.readSlice(arr.getDataBufferSafe()[current_start..current_end]);
+                current_start = current_end;
+            }
+            main_buffer_ptr[i_row + 1] = current_start;
+        } else {
+            const target_index = last_index + (std.math.cast(u32, prefix) orelse return ReadError.NegativeCharLen);
+            try arr.fitDataBuffer(target_index);
+            try state.readSlice(arr.getDataBufferSafe()[last_index..target_index]);
+            main_buffer_ptr[i_row + 1] = target_index;
         }
         return;
     }
@@ -1193,10 +1218,7 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
         return;
     }
 
-    var bcp_value: types.bcp = undefined;
-    if (!try state.read(&bcp_value)) {
-        return ReadError.EOF_unexpected;
-    }
+    const bcp_value = try state.readScalar(types.bcp);
 
     if (comptime format == .bit) {
         // TODO maybe sanity check if there are funny values
