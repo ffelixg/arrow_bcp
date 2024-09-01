@@ -4,23 +4,24 @@ import typing
 import itertools
 from . import zig_ext, bcp_format
 
+
 def array_capsule_generator(batch_iter: typing.Iterable[pa.RecordBatch], i_col: int):
     for batch in batch_iter:
         _, capsule_array = batch.columns[i_col].__arrow_c_array__()
         yield capsule_array
 
+
 def dump(batches: typing.Iterable[pa.RecordBatch], path_format: Path, path_data: Path):
+    "Write arrow data to bcp files. It is assumed that each batch has the same schema"
     batch_iter = iter(batches)
     first_batch = next(batch_iter)
     names = first_batch.column_names
-    schema_capsules = [
-        arr.__arrow_c_array__()[0]
-        for arr in first_batch.columns
-    ]
-    batch_iterators = itertools.tee(itertools.chain([first_batch], batch_iter), len(names))
+    schema_capsules = [arr.__arrow_c_array__()[0] for arr in first_batch.columns]
+    batch_iterators = itertools.tee(
+        itertools.chain([first_batch], batch_iter), len(names)
+    )
     array_capsules = [
-        array_capsule_generator(it, i_col)
-        for i_col, it in enumerate(batch_iterators)
+        array_capsule_generator(it, i_col) for i_col, it in enumerate(batch_iterators)
     ]
 
     path_data = path_data.absolute()
@@ -33,28 +34,35 @@ def dump(batches: typing.Iterable[pa.RecordBatch], path_format: Path, path_data:
             bytes_indicator=bi,
             bytes_data=bd,
             column_name=name,
-            collation=bcp_format.collation_utf8 if tp == "SQLCHAR" else bcp_format.collation_default,
+            collation=(
+                bcp_format.collation_utf8
+                if tp == "SQLCHAR"
+                else bcp_format.collation_default
+            ),
         )
         for (tp, bi, bd), name in zip(sql_info, names, strict=True)
     ]
     with path_format.open("wb") as f:
         f.write(bcp_format.dump(bcp_columns=bcp_columns))
 
-def load(bcp_columns: list[bcp_format.bcpColumn], path_data: Path) -> typing.Generator[pa.RecordBatch, None, None]:
+
+def load(
+    bcp_columns: list[bcp_format.bcpColumn], path_data: Path
+) -> typing.Generator[pa.RecordBatch, None, None]:
+    "Load a bcp data file into arrow batches according to the specified format."
     names = [col.column_name for col in bcp_columns]
 
-    reader_state = zig_ext.init_reader([
-        (col.type, col.bytes_indicator, col.bytes_data)
-        for col in bcp_columns
-    ], str(path_data.absolute()))
+    reader_state = zig_ext.init_reader(
+        [(col.type, col.bytes_indicator, col.bytes_data) for col in bcp_columns],
+        str(path_data.absolute()),
+    )
 
     go_again = True
     while go_again:
         max_rows = 42
         capsules = zig_ext.read_batch(reader_state, max_rows)
         arrays = [
-            pa.Array._import_from_c_capsule(schema, array)
-            for schema, array in capsules
+            pa.Array._import_from_c_capsule(schema, array) for schema, array in capsules
         ]
         batch = pa.record_batch(arrays, names=names)
         go_again = len(batch) == max_rows
