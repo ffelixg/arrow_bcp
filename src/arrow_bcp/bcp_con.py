@@ -27,16 +27,22 @@ class BcpReader:
         path_data: Path,
         tempdir_read: tempfile.TemporaryDirectory,
         bcp_columns: list[bcp_format.bcpColumn],
+        batch_size: int,
     ):
         self.path_data = path_data
         self.tempdir_read = tempdir_read
         self.bcp_columns = bcp_columns
         self.has_entered = False
+        self.batch_size = batch_size
 
     def __iter__(self) -> typing.Generator[pa.RecordBatch, None, None]:
         if not self.has_entered:
             raise Exception("Must use from context manager")
-        return bcp_data.load(path_data=self.path_data, bcp_columns=self.bcp_columns)
+        return bcp_data.load(
+            path_data=self.path_data,
+            bcp_columns=self.bcp_columns,
+            max_rows=self.batch_size,
+        )
 
     def __enter__(self):
         self.tempdir_read.__enter__()
@@ -148,10 +154,12 @@ class ConnectionInfo:
             path_dat = Path(tmpdir_dl_name) / "bcp_download.dat"
             if isinstance(arrow_data, pa.Table):
                 arrow_data = arrow_data.to_batches()
-            bcp_data.dump(batches=arrow_data, path_format=path_fmt, path_data=path_dat)
-            self.insert_file(path_format=path_fmt, path_data=path_dat, table=table)
+            if bcp_data.dump(
+                batches=arrow_data, path_format=path_fmt, path_data=path_dat
+            ):
+                self.insert_file(path_format=path_fmt, path_data=path_dat, table=table)
 
-    def download_arrow_batches(self, table: str) -> BcpReader:
+    def download_arrow_batches(self, table: str, batch_size: int = 500) -> BcpReader:
         """
         Download data for a table and return iterable of arrow batches to allow lazy loading.
         The returned reader object must be used from a context manager. Upon exiting the
@@ -179,9 +187,10 @@ class ConnectionInfo:
                 path_data=Path(tmpdir_read.name) / "bcp_download.dat",
                 tempdir_read=tmpdir_read,
                 bcp_columns=bcp_columns,
+                batch_size=batch_size,
             )
 
-    def download_arrow_table(self, table: str) -> pa.Table:
+    def download_arrow_table(self, table: str, batch_size: int = 500) -> pa.Table:
         """
         Wrapper around download_arrow_batches returning a singular table. The table's
         entire data is loaded at once.

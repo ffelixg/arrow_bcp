@@ -6,15 +6,27 @@ from . import zig_ext, bcp_format
 
 
 def array_capsule_generator(batch_iter: typing.Iterable[pa.RecordBatch], i_col: int):
+    dtype_prev = None
     for batch in batch_iter:
-        _, capsule_array = batch.columns[i_col].__arrow_c_array__()
+        col = batch.columns[i_col]
+        assert dtype_prev is None or col.type == dtype_prev
+        dtype_prev = col.type
+        _, capsule_array = col.__arrow_c_array__()
         yield capsule_array
 
 
-def dump(batches: typing.Iterable[pa.RecordBatch], path_format: Path, path_data: Path):
-    "Write arrow data to bcp files. It is assumed that each batch has the same schema"
+def dump(
+    batches: typing.Iterable[pa.RecordBatch], path_format: Path, path_data: Path
+) -> bool:
+    """
+    Write arrow data to bcp files. It is assumed that each batch has the same schema.
+    Return True if any data was written and False if no batches got submitted.
+    """
     batch_iter = iter(batches)
-    first_batch = next(batch_iter)
+    try:
+        first_batch = next(batch_iter)
+    except StopIteration:
+        return False
     names = first_batch.column_names
     schema_capsules = [arr.__arrow_c_array__()[0] for arr in first_batch.columns]
     batch_iterators = itertools.tee(
@@ -44,10 +56,11 @@ def dump(batches: typing.Iterable[pa.RecordBatch], path_format: Path, path_data:
     ]
     with path_format.open("wb") as f:
         f.write(bcp_format.dump(bcp_columns=bcp_columns))
+    return True
 
 
 def load(
-    bcp_columns: list[bcp_format.bcpColumn], path_data: Path
+    bcp_columns: list[bcp_format.bcpColumn], path_data: Path, max_rows: int
 ) -> typing.Generator[pa.RecordBatch, None, None]:
     "Load a bcp data file into arrow batches according to the specified format."
     names = [col.column_name for col in bcp_columns]
@@ -59,7 +72,6 @@ def load(
 
     go_again = True
     while go_again:
-        max_rows = 42
         capsules = zig_ext.read_batch(reader_state, max_rows)
         arrays = [
             pa.Array._import_from_c_capsule(schema, array) for schema, array in capsules
