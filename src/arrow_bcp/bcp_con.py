@@ -57,7 +57,7 @@ def _run_proc(args, operation):
     proc = subprocess.run(args, capture_output=True)
     try:
         proc.check_returncode()
-    except BcpError as e:
+    except Exception as e:
         raise BcpError(
             f"BCP process to {operation} terminated with error",
             proc.stdout,
