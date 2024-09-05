@@ -5,8 +5,9 @@ import subprocess
 from pathlib import Path
 import platform
 import sysconfig
+import shutil
 
-module_name = "arrow-bcp"
+module_name = "arrow_bcp"
 
 class ZigBuilder(build_ext):
     def build_extension(self, ext):
@@ -39,7 +40,7 @@ class ZigBuilder(build_ext):
         ], cwd=source)
 
         binary, = (p for p in Path("src-zig", "zig-out").glob(f"**/*{'.dll' if windows else ''}") if p.is_file())
-        binary.rename(build_path / self.get_ext_filename(ext.name))
+        shutil.copyfile(binary, build_path / self.get_ext_filename(ext.name))
 
 setup(
     ext_modules=[Extension("zig_ext", ["src-zig"])],
