@@ -6,7 +6,7 @@ from pathlib import Path
 import platform
 import sysconfig
 
-module_name = "arrow_bcp"
+module_name = "arrow-bcp"
 
 class ZigBuilder(build_ext):
     def build_extension(self, ext):
