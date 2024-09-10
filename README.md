@@ -11,7 +11,7 @@ The purpose of this library is to (de-)serialize `pyarrow` dataframes into SQL S
 
 Some wrappers around the bcp CLI are provided as well to simplify interaction with it.
 
-For example usage, see the notebooks in the examples directory.
+For example usage including a benchmark for inserts, see the notebooks in the examples directory.
 
 # Prerequisites
 
