@@ -9,14 +9,18 @@ description = "Transfer data between pyarrow and SQL Server using Microsoft's Bu
 readme = "README.md"
 requires-python = ">=3.10"
 keywords = ["bcp", "arrow", "mssql", "sql server"]
-license = { file = "LICENSE" }
+license = { text = "MIT License" }
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
 ]
 dependencies = ["pyarrow"]
-version = "0.9.0"
+version = "0.9.1"
+
+[project.urls]
+Homepage = "https://github.com/ffelixg/arrow_bcp"
+Issues = "https://github.com/ffelixg/arrow_bcp/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

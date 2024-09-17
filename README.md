@@ -1,5 +1,7 @@
 # arrow-bcp
 
+    pip install arrow-bcp
+
 When loading data into SQL Server from Python, the common methods are based on the ODBC interface and driver. While this is a tried and tested approach, the performance is not optimal. Reasons for this include:
 
 * *minimal logging* cannot be used by regular insert statements unless they use table-valued parameters, which are cumbersome to use.
