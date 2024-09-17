@@ -1,6 +1,6 @@
 import collections
 
-space = int.from_bytes(b" ")
+space = b" "[0]
 offsets = (8, 28, 36, 44, 49, 55)
 bcpColumn = collections.namedtuple(
     "bcpColumn", ["type", "bytes_indicator", "bytes_data", "column_name", "collation"]
