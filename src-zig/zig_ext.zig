@@ -595,7 +595,7 @@ const format_sizes = blk: {
 inline fn bit_get(ptr: anytype, index: anytype) bool {
     const ptr_cast: [*]u8 = @ptrCast(@alignCast(ptr));
     const selector: u3 = @intCast(index % 8);
-    return 0 == (ptr_cast[@divFloor(index, 8)] & (@as(u8, 1) << selector));
+    return 0 != (ptr_cast[@divFloor(index, 8)] & (@as(u8, 1) << selector));
 }
 
 inline fn bit_set(ptr: anytype, index: anytype, comptime value: bool) void {
@@ -628,7 +628,7 @@ inline fn write_cell(self: *Column, writer: *buffered_writer_type, comptime form
         if (comptime format == .null) {
             break :blk true;
         } else if (self.valid_buffer()) |buf| {
-            break :blk bit_get(buf, self.next_index);
+            break :blk !bit_get(buf, self.next_index);
         } else break :blk false;
     };
 
