@@ -68,9 +68,7 @@ def dump(bcp_columns: list[bcpColumn]) -> bytes:
                     str(col.bytes_data).encode().ljust(just[3]),
                     b'""'.ljust(just[4]),
                     str(i_col).encode().ljust(just[5]),
-                    # col.column_name.encode().ljust(just[6]),
-                    (b"a" * i_col).ljust(just[6]),
-                    # b"LATIN1_GENERAL_100_CI_AS_SC_UTF8" if col.type == "SQLCHAR" else b'""',
+                    f"column_{i_col}".encode().ljust(just[6]),
                     col.collation.encode(),
                 ]
             )
