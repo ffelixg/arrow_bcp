@@ -213,7 +213,7 @@ const ArrowArray = extern struct {
     }
 
     fn getDataBufferSafe(self: *ArrowArray) [*]u8 {
-        return @alignCast(@ptrCast(self.buffers.?[2].?));
+        return @ptrCast(@alignCast(self.buffers.?[2].?));
     }
 };
 
@@ -228,7 +228,7 @@ fn capsule_name(T: type) [*c]const u8 {
 
 fn from_capsule(T: type, capsule: *PyObject) ?*T {
     const ptr = py.PyCapsule_GetPointer(capsule, capsule_name(T)) orelse return null;
-    return @alignCast(@ptrCast(ptr));
+    return @ptrCast(@alignCast(ptr));
 }
 
 fn to_capsule(c_data: anytype) !*PyObject {
@@ -328,6 +328,8 @@ const BcpInfo = struct {
                 'g' => try BcpInfo.init(.float64, "SQLFLT8"),
                 'z' => try BcpInfo.init(.bytes, "SQLBINARY"),
                 'u' => try BcpInfo.init(.bytes, "SQLCHAR"),
+                'Z' => try BcpInfo.init(.large_bytes, "SQLBINARY"),
+                'U' => try BcpInfo.init(.large_bytes, "SQLCHAR"),
                 'n' => try BcpInfo.init(.null, "SQLBINARY"),
                 else => raise_args(.NotImplemented, "Format '{s}' not implemented", .{fmt}),
             };
@@ -480,7 +482,7 @@ const Column = struct {
         };
         defer py.Py_DECREF(array_capsule);
         const array_ptr = py.PyCapsule_GetPointer(array_capsule, "arrow_array") orelse return Err.PyError;
-        const current_array_ptr: *ArrowArray = @alignCast(@ptrCast(array_ptr));
+        const current_array_ptr: *ArrowArray = @ptrCast(@alignCast(array_ptr));
         if (current_array_ptr.offset != 0) {
             return raise(.NotImplemented, "ArrowArray offset field is not supported");
         }
@@ -493,7 +495,7 @@ const Column = struct {
     inline fn valid_buffer(self: *Column) ?[*]bool {
         if (self.current_array.buffers) |buf| {
             if (self.current_array.n_buffers > 0) {
-                return @alignCast(@ptrCast(buf[0]));
+                return @ptrCast(@alignCast(buf[0]));
             }
         }
         return null;
@@ -502,7 +504,7 @@ const Column = struct {
     inline fn main_buffer(self: *Column, tp: type) ![*]tp {
         if (self.current_array.buffers) |buf| {
             if (self.current_array.n_buffers > 1) {
-                return @alignCast(@ptrCast(buf[1] orelse return WriteError.MissingBuffer));
+                return @ptrCast(@alignCast(buf[1] orelse return WriteError.MissingBuffer));
             }
         }
         return WriteError.MissingBuffer;
@@ -511,7 +513,7 @@ const Column = struct {
     inline fn data_buffer(self: *Column) ![*]u8 {
         if (self.current_array.buffers) |buf| {
             if (self.current_array.n_buffers > 2) {
-                return @alignCast(@ptrCast(buf[2] orelse return WriteError.MissingBuffer));
+                return @ptrCast(@alignCast(buf[2] orelse return WriteError.MissingBuffer));
             }
         }
         return WriteError.MissingBuffer;
@@ -532,6 +534,7 @@ const formats = enum(i64) {
     float32,
     float64,
     bytes,
+    large_bytes,
     decimal,
     date,
     time32,
@@ -557,6 +560,7 @@ inline fn format_types(comptime format: formats) struct { prefix: type, arrow: t
         inline formats.float32 => .{ i8, f32, f32 },
         inline formats.float64 => .{ i8, f64, f64 },
         inline formats.bytes => .{ i64, u32, u32 },
+        inline formats.large_bytes => .{ i64, u64, u32 },
         inline formats.bytes_fixed => .{ i64, i0, i0 },
         inline formats.decimal => .{ i8, i128, Decimal },
         inline formats.date => .{ i8, i32, u24 },
@@ -589,13 +593,13 @@ const format_sizes = blk: {
 };
 
 inline fn bit_get(ptr: anytype, index: anytype) bool {
-    const ptr_cast: [*]u8 = @alignCast(@ptrCast(ptr));
+    const ptr_cast: [*]u8 = @ptrCast(@alignCast(ptr));
     const selector: u3 = @intCast(index % 8);
     return 0 == (ptr_cast[@divFloor(index, 8)] & (@as(u8, 1) << selector));
 }
 
 inline fn bit_set(ptr: anytype, index: anytype, comptime value: bool) void {
-    const ptr_cast: [*]u8 = @alignCast(@ptrCast(ptr));
+    const ptr_cast: [*]u8 = @ptrCast(@alignCast(ptr));
     const selector: u3 = @intCast(index % 8);
     if (comptime value) {
         ptr_cast[@divFloor(index, 8)] |= @as(u8, 1) << selector;
@@ -615,7 +619,7 @@ inline fn write_cell(self: *Column, writer: *buffered_writer_type, comptime form
         inline else => try self.main_buffer(types.arrow),
     };
     const bytes_bcp: usize = switch (format) {
-        inline .bytes => main_buffer[self.next_index + 1] - main_buffer[self.next_index],
+        inline .bytes, .large_bytes => main_buffer[self.next_index + 1] - main_buffer[self.next_index],
         inline .bytes_fixed => self.bcp_info.bytes_fixed_size,
         inline else => types_size.bcp,
     };
@@ -630,7 +634,7 @@ inline fn write_cell(self: *Column, writer: *buffered_writer_type, comptime form
 
     _ = writer.write(blk: {
         const val: types.prefix = if (is_null) -1 else @intCast(bytes_bcp);
-        const bytes: [*]u8 = @constCast(@ptrCast(&val));
+        const bytes: [*]u8 = @ptrCast(@constCast(&val));
         break :blk bytes[0..types_size.prefix];
     }) catch return WriteError.WriterError;
 
@@ -638,7 +642,7 @@ inline fn write_cell(self: *Column, writer: *buffered_writer_type, comptime form
         return;
     }
 
-    if (comptime format == .bytes) {
+    if (comptime format == .bytes or format == .large_bytes) {
         const data_buffer = try self.data_buffer();
         _ = writer.write(data_buffer[main_buffer[self.next_index]..main_buffer[self.next_index + 1]]) catch return WriteError.WriterError;
     } else if (comptime format == .bytes_fixed) {
@@ -673,7 +677,7 @@ inline fn write_cell(self: *Column, writer: *buffered_writer_type, comptime form
             inline else => @as(types.bcp, val_arrow),
         };
         _ = writer.write(blk: {
-            const bytes: [*]u8 = @constCast(@ptrCast(&val_bcp));
+            const bytes: [*]u8 = @ptrCast(@constCast(&val_bcp));
             break :blk bytes[0..bytes_bcp];
         }) catch return WriteError.WriterError;
     }
@@ -810,7 +814,7 @@ fn write_arrow(py_args: ?*PyObject) !?*PyObject {
         const chunk_generator = py.PySequence_GetItem(args.array_generators, @intCast(i_col)) orelse return Err.PyError;
         defer py.Py_DECREF(chunk_generator);
         const schema_ptr = py.PyCapsule_GetPointer(capsule_schema, "arrow_schema") orelse return Err.PyError;
-        const schema: *ArrowSchema = @alignCast(@ptrCast(schema_ptr));
+        const schema: *ArrowSchema = @ptrCast(@alignCast(schema_ptr));
 
         col.* = Column{
             ._chunk_generator = py.Py_NewRef(chunk_generator),
@@ -886,7 +890,7 @@ fn write_arrow(py_args: ?*PyObject) !?*PyObject {
         const item = try zig_to_py(.{
             col.bcp_info.dtype_name,
             sizes.prefix,
-            if (col.bcp_info.format == .bytes or col.bcp_info.format == .bytes_fixed) 0 else sizes.bcp,
+            if (col.bcp_info.format == .bytes or col.bcp_info.format == .large_bytes or col.bcp_info.format == .bytes_fixed) 0 else sizes.bcp,
         });
         defer py.Py_DECREF(item);
         if (py.PyList_Append(format_list, item) == -1) {
@@ -1102,7 +1106,7 @@ fn read_batch(py_args: ?*PyObject) !*PyObject {
         const array = try malloc.create(ArrowArray);
         errdefer malloc.destroy(array);
         array.* = .{
-            .buffers = @alignCast(@ptrCast(buffers.ptr)),
+            .buffers = @ptrCast(@alignCast(buffers.ptr)),
             .length = 0,
             .n_buffers = @intCast(buffers.len),
             .null_count = 0,
@@ -1181,7 +1185,7 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
     arr.length += 1;
 
     if (comptime format == .binary or format == .char) {
-        const main_buffer_ptr: [*]u32 = @alignCast(@ptrCast(arr.buffers.?[1].?));
+        const main_buffer_ptr: [*]u32 = @ptrCast(@alignCast(arr.buffers.?[1].?));
         const last_index = main_buffer_ptr[i_row];
         if (prefix == -1) {
             main_buffer_ptr[i_row + 1] = last_index;
@@ -1250,7 +1254,7 @@ inline fn read_cell(i_row: usize, state: *ReaderState, arr: *ArrowArray, comptim
         inline else => @as(types.arrow, bcp_value),
     };
 
-    const main_buffer: [*]types.arrow = @alignCast(@ptrCast(arr.buffers.?[1].?));
+    const main_buffer: [*]types.arrow = @ptrCast(@alignCast(arr.buffers.?[1].?));
     main_buffer[i_row] = arrow_value;
 }
 
