@@ -38,12 +38,14 @@ class ZigBuilder(build_ext):
             "build",
             *(["-Dtarget=x86_64-windows"] if windows else []),
             "--release=safe",
+            "-Dcpu=baseline",
         ], cwd=source)
 
         binary, = (p for p in Path("src-zig", "zig-out").glob(f"**/*{'.dll' if windows else ''}") if p.is_file())
         shutil.copyfile(binary, build_path / self.get_ext_filename(ext.name))
 
 setup(
-    ext_modules=[Extension("zig_ext", ["src-zig"])],
+    ext_modules=[Extension("zig_ext", ["src-zig"], py_limited_api=True)],
     cmdclass={"build_ext": ZigBuilder},
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
 )

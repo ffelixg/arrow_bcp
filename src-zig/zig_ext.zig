@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const print = std.debug.print;
 const py = @cImport({
-    @cDefine("Py_LIMITED_API", "0x030a00f0");
+    @cDefine("Py_LIMITED_API", "0x030A0000");
     @cDefine("PY_SSIZE_T_CLEAN", {});
     @cInclude("Python.h");
 });
